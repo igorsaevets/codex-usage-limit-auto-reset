@@ -33,7 +33,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
 UTC = timezone.utc
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.6.1"
 POLICY_SCHEMA_VERSION = 1
 MINIMUM_SCHEDULE_MARGIN_SECONDS = 600
 TASK_START_LEAD_SECONDS = 17 * 60
