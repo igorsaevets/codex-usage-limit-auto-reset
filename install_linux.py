@@ -38,6 +38,24 @@ MANAGER_TIMER = "codex-reset-manager-sync.timer"
 MANAGER_ENVIRONMENT_KEYS = {"CODEX_HOME", "CODEX_RESET_NPM", "PATH"}
 SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 LIVE_SYSTEM_PATH = "/usr/bin:/bin"
+LINUX_CHILD_ENV_ALLOWLIST = {
+    "DBUS_SESSION_BUS_ADDRESS",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "USER",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+    "XDG_STATE_HOME",
+}
 CONSUME_UNIT_RE = re.compile(
     r"codex-reset-consume-(?P<credit>[0-9a-f]{12})-(?P<job>[0-9a-f]{8})\.timer"
 )
@@ -93,6 +111,22 @@ class UnitState:
     active: bool
 
 
+def _scrubbed_child_environment(
+    extra: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    environment: dict[str, str] = {}
+    for name in LINUX_CHILD_ENV_ALLOWLIST:
+        value = os.environ.get(name)
+        if isinstance(value, str) and value:
+            environment[name] = value
+    environment.setdefault("PATH", LIVE_SYSTEM_PATH)
+    if extra:
+        for key, value in extra.items():
+            if isinstance(value, str) and value:
+                environment[key] = value
+    return environment
+
+
 def _run(
     command: Sequence[str | os.PathLike[str]],
     *,
@@ -111,7 +145,7 @@ def _run(
             errors="replace",
             timeout=timeout,
             check=False,
-            env=dict(env) if env is not None else None,
+            env=dict(env) if env is not None else _scrubbed_child_environment(),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise InstallError(f"command failed to run: {command[0]}") from error
@@ -450,10 +484,12 @@ def _deterministic_path(npm: Path) -> str:
 
 
 def _pinned_npm_environment(npm: Path) -> dict[str, str]:
-    environment = os.environ.copy()
-    environment["CODEX_RESET_NPM"] = str(npm)
-    environment["PATH"] = _deterministic_path(npm)
-    return environment
+    return _scrubbed_child_environment(
+        {
+            "CODEX_RESET_NPM": str(npm),
+            "PATH": _deterministic_path(npm),
+        }
+    )
 
 
 @contextlib.contextmanager
@@ -796,7 +832,7 @@ def _consume_service(runtime: RuntimeFiles, layout: Layout, manifest: Path) -> b
         f"WorkingDirectory={_unit_scalar_path(layout.root)}\n"
         f"Environment={_unit_quote('PATH=' + LIVE_SYSTEM_PATH)}\n"
         "Restart=no\n"
-        "TimeoutStartSec=10min\n"
+        "TimeoutStartSec=20min\n"
         "UMask=0077\n"
         "NoNewPrivileges=yes\n"
     ).encode()

@@ -36,7 +36,7 @@ UTC = timezone.utc
 APP_VERSION = "2.5.0"
 POLICY_SCHEMA_VERSION = 1
 MINIMUM_SCHEDULE_MARGIN_SECONDS = 600
-TASK_START_LEAD_SECONDS = 345
+TASK_START_LEAD_SECONDS = 17 * 60
 TERMINAL_STATES = {
     "SUCCEEDED",
     "NO_ACTION",
@@ -64,6 +64,8 @@ _UI_MUTED_TEXT = {
     "Not checked",
     "No reservation",
     "No history",
+    "No free reset",
+    "Not available",
     "Checking...",
     "PENDING",
     "DISARMED",
@@ -76,6 +78,16 @@ _UI_MUTED_TEXT = {
 def _ui_tone_for_text(value: object) -> str:
     """Return a supplemental visual tone without changing status semantics."""
     text = str(value).strip()
+    if "% used" in text:
+        try:
+            pct = float(text.split("%")[0].strip())
+            if pct >= 95.0:
+                return "danger"
+            if pct >= 80.0:
+                return "warning"
+            return "positive"
+        except Exception:
+            return "neutral"
     if text in _UI_POSITIVE_TEXT:
         return "positive"
     if text in _UI_INFO_TEXT:
@@ -109,6 +121,45 @@ SENSITIVE_POLICY_KEYS = {
 WINDOWLESS_SUBPROCESS_FLAGS = (
     subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 )
+WINDOWS_CHILD_ENV_ALLOWLIST = {
+    "APPDATA",
+    "COMSPEC",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "OS",
+    "PATH",
+    "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "PROGRAMDATA",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERNAME",
+    "USERPROFILE",
+    "WINDIR",
+}
+LINUX_CHILD_ENV_ALLOWLIST = {
+    "DBUS_SESSION_BUS_ADDRESS",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "USER",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+    "XDG_STATE_HOME",
+}
 UI_LOCK_BUSY_CODE = "MANAGER_UI_ALREADY_RUNNING"
 UI_LOCK_FILENAME = "manager-ui.lock"
 UI_SHOW_REQUEST_FILENAME = "manager-ui-show-request.json"
@@ -118,6 +169,27 @@ UI_READY_FILENAME = "manager-ui-ready.json"
 # while tolerating timestamp truncation and a small amount of clock skew.
 UI_SHOW_REQUEST_MAX_AGE_SECONDS = 30
 UI_SHOW_REQUEST_FUTURE_SKEW_SECONDS = 5
+
+
+def _child_process_environment(
+    *, extra: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    source = os.environ
+    allowed = (
+        LINUX_CHILD_ENV_ALLOWLIST if sys.platform.startswith("linux") else WINDOWS_CHILD_ENV_ALLOWLIST
+    )
+    env: dict[str, str] = {}
+    for key in allowed:
+        value = source.get(key)
+        if isinstance(value, str) and value:
+            env[key] = value
+    if sys.platform.startswith("linux"):
+        env.setdefault("PATH", "/usr/bin:/bin")
+    if extra:
+        for key, value in extra.items():
+            if isinstance(value, str) and value:
+                env[key] = value
+    return env
 
 
 def _manager_console_python() -> Path:
@@ -834,6 +906,7 @@ class RealServices:
                 errors="replace",
                 timeout=20,
                 check=False,
+                env=_child_process_environment(),
                 creationflags=WINDOWLESS_SUBPROCESS_FLAGS,
             )
             if completed.returncode != 0:
@@ -905,6 +978,7 @@ class RealServices:
                 errors="replace",
                 timeout=30,
                 check=False,
+                env=_child_process_environment(),
                 creationflags=WINDOWLESS_SUBPROCESS_FLAGS,
             )
             if validation.returncode != 0:
@@ -936,6 +1010,7 @@ class RealServices:
                 errors="replace",
                 timeout=30,
                 check=False,
+                env=_child_process_environment(),
                 creationflags=WINDOWLESS_SUBPROCESS_FLAGS,
             )
             if completed.returncode != 0:
@@ -985,6 +1060,7 @@ class RealServices:
                 errors="replace",
                 timeout=20,
                 check=False,
+                env=_child_process_environment(),
                 creationflags=WINDOWLESS_SUBPROCESS_FLAGS,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
@@ -1003,7 +1079,7 @@ class RealServices:
         if not pwsh:
             raise ManagerError("POWERSHELL_NOT_FOUND")
         manager_python = _manager_console_python()
-        env = os.environ.copy()
+        env = _child_process_environment()
         if runtime_guard:
             env["CODEX_RESET_MANAGER_RUNTIME_GUARD"] = runtime_guard
         try:
@@ -1053,7 +1129,7 @@ class LinuxServices(RealServices):
 
     @staticmethod
     def _systemctl_environment() -> dict[str, str]:
-        environment = os.environ.copy()
+        environment = _child_process_environment()
         environment.update(
             {
                 "LC_ALL": "C",
@@ -1329,6 +1405,7 @@ class LinuxServices(RealServices):
                 errors="replace",
                 timeout=600,
                 check=False,
+                env=_child_process_environment(),
                 creationflags=WINDOWLESS_SUBPROCESS_FLAGS,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
@@ -2074,7 +2151,7 @@ class Controller:
         )
 
     def _log(self, event: str, **fields: Any) -> None:
-        allowed = {key: value for key, value in fields.items() if key in {"code", "state", "expiresAtUtc"}}
+        allowed = {key: value for key, value in fields.items() if key in {"automaticLimitResetAtUtc", "code", "expiresAtUtc", "freeResetExpiresAtUtc", "state"}}
         payload = {"atUtc": _utc_text(self.now()), "event": event, **allowed}
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("a", encoding="utf-8", newline="\n") as stream:
@@ -2504,6 +2581,50 @@ class Controller:
             current = self._ref_job(policy, jobs) if policy["currentJob"] else None
             return self._status_from(policy, current, time_state="unknown")
 
+    def _observe_status_locked(self, policy: dict[str, Any], jobs: list[Job]) -> dict[str, Any]:
+        current = self._adopt(policy, jobs)
+        try:
+            self.services.time_status()
+            time_state = "synchronized"
+        except ManagerError:
+            time_state = "attention"
+        snapshot, credits = self._validate_runtime(policy)
+        policy["lastSyncAtUtc"] = _utc_text(self.now())
+        status = self._status_from(
+            policy,
+            current,
+            time_state=time_state,
+            free_reset_expires_at_utc=(_utc_text(credits[0].expires_at) if credits else None),
+            automatic_limit_reset_at_utc=self._automatic_limit_reset_at_utc(snapshot),
+            primary_used_percent=snapshot.get("primaryUsedPercent"),
+            primary_window_duration_mins=snapshot.get("primaryWindowDurationMins"),
+            plan_type=snapshot.get("planType"),
+        )
+        self._save_policy(policy)
+        self._log(
+            "status",
+            state=str(status["automation"]).upper(),
+            freeResetExpiresAtUtc=status.get("freeResetExpiresAtUtc"),
+            automaticLimitResetAtUtc=status.get("automaticLimitResetAtUtc"),
+        )
+        return status
+
+    def observe_status(self) -> dict[str, Any]:
+        def action(policy: dict[str, Any], jobs: list[Job]) -> dict[str, Any]:
+            return self._observe_status_locked(policy, jobs)
+
+        try:
+            return self._mutating_operation(action)
+        except ManagerError as error:
+            if error.code not in {"CONTROLLER_BUSY", "LIVE_DISPATCH_ACTIVE"} or not self.policy_path.is_file():
+                raise
+            policy = _read_object(self.policy_path, "POLICY_INVALID")
+            _validate_policy(policy)
+            jobs = self._jobs()
+            current = self._ref_job(policy, jobs) if policy["currentJob"] else None
+            return self._status_from(policy, current, time_state="unknown")
+
+
     def enable(self) -> dict[str, Any]:
         def action(policy: dict[str, Any], jobs: list[Job]) -> dict[str, Any]:
             policy["enabled"] = True
@@ -2561,6 +2682,8 @@ class Controller:
 
     def sync(self, *, scheduled: bool = False) -> dict[str, Any]:
         def action(policy: dict[str, Any], jobs: list[Job]) -> dict[str, Any]:
+            if not policy["enabled"] and not scheduled:
+                return self._observe_status_locked(policy, jobs)
             return self._sync_locked(policy, jobs)
 
         try:
@@ -2569,6 +2692,7 @@ class Controller:
             if scheduled and error.code in {"CONTROLLER_BUSY", "LIVE_DISPATCH_ACTIVE"}:
                 return self.bootstrap_status()
             raise
+
 
     def doctor(self) -> dict[str, Any]:
         issues: list[str] = []
@@ -2612,6 +2736,21 @@ class Controller:
             issues.append(error.code)
         return {"healthy": not issues, "issues": sorted(set(issues)), "status": status}
 
+    @staticmethod
+    def _automatic_limit_reset_at_utc(snapshot: Mapping[str, Any]) -> str | None:
+        observed_utc = snapshot.get("automaticLimitResetAtUtc")
+        if observed_utc is not None:
+            if not isinstance(observed_utc, str):
+                raise ManagerError("CLI_VALIDATION_FAILED")
+            _utc_epoch(observed_utc)
+            return observed_utc
+        observed_epoch = snapshot.get("automaticLimitResetAt")
+        if observed_epoch is None:
+            return None
+        if type(observed_epoch) is not int or observed_epoch <= 0:
+            raise ManagerError("CLI_VALIDATION_FAILED")
+        return _utc_text(observed_epoch)
+
     def _status_from(
         self,
         policy: Mapping[str, Any],
@@ -2619,6 +2758,12 @@ class Controller:
         *,
         time_state: str,
         reservation: str | None = None,
+        free_reset_expires_at_utc: str | None = None,
+        automatic_limit_reset_at_utc: str | None = None,
+        cli_status_override: str | None = None,
+        primary_used_percent: float | None = None,
+        primary_window_duration_mins: int | None = None,
+        plan_type: str | None = None,
     ) -> dict[str, Any]:
         blocked = policy.get("blocked")
         blocked_code = blocked.get("code") if isinstance(blocked, Mapping) else None
@@ -2641,11 +2786,18 @@ class Controller:
         cli_status = "compatible" if isinstance(approved, Mapping) else "pending"
         if blocked_code and blocked_code.startswith(("CLI_", "GUARD_")):
             cli_status = "attention"
+        if cli_status_override is not None:
+            cli_status = cli_status_override
         return {
             "automation": automation,
             "enabled": bool(policy["enabled"]),
             "nextExpiresAtUtc": _utc_text(current.expires_at) if current and not current.terminal else None,
             "nextProcessAtUtc": _utc_text(current.process_at) if current and not current.terminal else None,
+            "freeResetExpiresAtUtc": free_reset_expires_at_utc,
+            "automaticLimitResetAtUtc": automatic_limit_reset_at_utc,
+            "primaryUsedPercent": primary_used_percent,
+            "primaryWindowDurationMins": primary_window_duration_mins,
+            "planType": plan_type,
             "cliStatus": cli_status,
             "timeStatus": time_state,
             "lastResult": policy.get("lastResult"),
@@ -2656,6 +2808,63 @@ class Controller:
 
 def _local_time(epoch: int) -> str:
     return datetime.fromtimestamp(epoch, UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _remaining_duration_text(target_epoch: int, *, now: float | None = None) -> str:
+    remaining = max(0, target_epoch - int(now if now is not None else time.time()))
+    days, remainder = divmod(remaining, 86_400)
+    hours, remainder = divmod(remainder, 3_600)
+    minutes, _seconds = divmod(remainder, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if days or hours:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def _status_deadline_text(timestamp_utc: str | None, *, empty: str, now: float | None = None) -> str:
+    if not isinstance(timestamp_utc, str):
+        return empty
+    target_epoch = _utc_epoch(timestamp_utc)
+    local_text = _local_time(target_epoch)
+    remaining = target_epoch - int(now if now is not None else time.time())
+    if remaining <= 0:
+        return f"Expired ({local_text})"
+    return f"{_remaining_duration_text(target_epoch, now=now)} left ({local_text})"
+
+
+def _ensure_log_file(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text("", encoding="utf-8")
+    return path
+
+
+def _open_log_file(path: Path) -> None:
+    target = _ensure_log_file(path)
+    if os.name == "nt":
+        startfile = getattr(os, "startfile", None)
+        if callable(startfile):
+            startfile(str(target))
+            return
+        subprocess.Popen(
+            ["notepad.exe", str(target)],
+            env=_child_process_environment(),
+            creationflags=WINDOWLESS_SUBPROCESS_FLAGS,
+        )
+        return
+    opener = shutil.which("xdg-open")
+    if opener:
+        subprocess.Popen(
+            [opener, str(target)],
+            env=_child_process_environment(),
+            creationflags=WINDOWLESS_SUBPROCESS_FLAGS,
+        )
+        return
+    raise ManagerError("LOG_OPEN_FAILED")
+
 
 
 def _system_time_label() -> str:
@@ -2689,10 +2898,24 @@ def _human_status(status: Mapping[str, Any]) -> str:
         status.get("automation"), "Needs attention"
     )
     lines = [f"Automatic use: {automation}"]
-    expires = status.get("nextExpiresAtUtc")
+    used_pct = status.get("primaryUsedPercent")
+    if isinstance(used_pct, (int, float)):
+        used_val = float(used_pct)
+        rem_val = max(0.0, 100.0 - used_val)
+        dur = status.get("primaryWindowDurationMins")
+        dur_str = f" ({dur // 1440}d window)" if dur and dur >= 1440 else (f" ({dur // 60}h window)" if dur else "")
+        lines.append(f"Current usage: {used_val:.1f}% used ({rem_val:.1f}% left){dur_str}")
+    automatic_limit = status.get("automaticLimitResetAtUtc")
+    if automatic_limit is not None or "automaticLimitResetAtUtc" in status:
+        lines.append(
+            f"Automatic limit reset: {_status_deadline_text(automatic_limit if isinstance(automatic_limit, str) else None, empty='Not available')}"
+        )
+    free_reset = status.get("freeResetExpiresAtUtc") or status.get("nextExpiresAtUtc")
+    if free_reset is not None or "freeResetExpiresAtUtc" in status or "nextExpiresAtUtc" in status:
+        lines.append(
+            f"Free reset expires: {_status_deadline_text(free_reset if isinstance(free_reset, str) else None, empty='No free reset')}"
+        )
     process = status.get("nextProcessAtUtc")
-    if isinstance(expires, str):
-        lines.append(f"Next reset expires: {_local_time(_utc_epoch(expires))}")
     if isinstance(process, str):
         lines.append(f"Automatic use scheduled: {_local_time(_utc_epoch(process))}")
     cli_text = {
@@ -2759,9 +2982,9 @@ def run_ui(controller: Controller) -> int:
     tray: NativeTrayIcon | None = None
     try:
         root = tk.Tk()
-        root.title("Codex Usage Limit Reset Manager")
-        root.geometry("600x430")
-        root.minsize(560, 400)
+        root.title(f"Codex Usage Limit Reset Manager v{APP_VERSION}")
+        root.geometry("640x490")
+        root.minsize(600, 450)
         root.configure(background="#FFFFFF")
         root.option_add("*Font", ("Segoe UI", 10))
 
@@ -2808,13 +3031,13 @@ def run_ui(controller: Controller) -> int:
         frame.pack(fill="both", expand=True)
         title = ttk.Label(
             frame,
-            text="Codex Usage Limit Reset Manager",
+            text=f"Codex Usage Limit Reset Manager  v{APP_VERSION}",
             style="Manager.Title.TLabel",
         )
         title.pack(anchor="w")
         subtitle = ttk.Label(
             frame,
-            text="Safely uses one selected usage limit reset about five minutes before it expires.",
+            text=f"Version {APP_VERSION} · Safely uses one selected usage limit reset about five minutes before it expires.",
             style="Manager.Subtitle.TLabel",
             wraplength=520,
         )
@@ -2822,11 +3045,13 @@ def run_ui(controller: Controller) -> int:
 
         variables = {
             name: tk.StringVar(value="Checking...")
-            for name in ("automation", "expires", "process", "cli", "clock", "result", "reservation")
+            for name in ("automation", "usage", "auto_reset", "free_reset", "process", "cli", "clock", "result", "reservation")
         }
         labels = (
             ("Automatic use", "automation"),
-            ("Next reset expires", "expires"),
+            ("Current usage", "usage"),
+            ("Automatic limit reset", "auto_reset"),
+            ("Free reset expires", "free_reset"),
             ("Scheduled use", "process"),
             ("Codex CLI", "cli"),
             (_system_time_label(), "clock"),
@@ -2873,12 +3098,15 @@ def run_ui(controller: Controller) -> int:
         refresh = ttk.Button(buttons, text="Check Now", style="Manager.TButton")
         doctor_button = ttk.Button(
             buttons,
-            text="Troubleshoot and Logs",
+            text="Troubleshoot",
             style="Manager.TButton",
         )
+        open_log_button = ttk.Button(buttons, text="Open Log", style="Manager.TButton")
         toggle.pack(side="left")
         refresh.pack(side="left", padx=10)
         doctor_button.pack(side="left")
+        open_log_button.pack(side="left", padx=(10, 0))
+
         footer = ttk.Label(
             frame,
             text="Automation continues when this window is hidden or exited.",
@@ -2899,10 +3127,27 @@ def run_ui(controller: Controller) -> int:
                     status.get("automation"), "Needs attention"
                 )
             )
-            variables["expires"].set(
-                _local_time(_utc_epoch(status["nextExpiresAtUtc"]))
-                if status.get("nextExpiresAtUtc")
-                else "No reservation"
+            used_pct = status.get("primaryUsedPercent")
+            if isinstance(used_pct, (int, float)):
+                used_val = float(used_pct)
+                rem_val = max(0.0, 100.0 - used_val)
+                dur = status.get("primaryWindowDurationMins")
+                dur_str = f" ({dur // 1440}d window)" if dur and dur >= 1440 else (f" ({dur // 60}h window)" if dur else "")
+                variables["usage"].set(f"{used_val:.1f}% used ({rem_val:.1f}% left){dur_str}")
+            else:
+                variables["usage"].set("Not available")
+            variables["auto_reset"].set(
+                _status_deadline_text(
+                    status.get("automaticLimitResetAtUtc") if isinstance(status.get("automaticLimitResetAtUtc"), str) else None,
+                    empty="Not available",
+                )
+            )
+            free_reset_utc = status.get("freeResetExpiresAtUtc") or status.get("nextExpiresAtUtc")
+            variables["free_reset"].set(
+                _status_deadline_text(
+                    free_reset_utc if isinstance(free_reset_utc, str) else None,
+                    empty="No free reset",
+                )
             )
             variables["process"].set(
                 _local_time(_utc_epoch(status["nextProcessAtUtc"]))
@@ -2955,7 +3200,7 @@ def run_ui(controller: Controller) -> int:
                 elif kind == "doctor":
                     result = controller.doctor()
                 else:
-                    result = controller.bootstrap_status()
+                    result = controller.observe_status()
                 events.put((kind, result))
             except Exception as error:
                 code = error.code if isinstance(error, ManagerError) else "UNEXPECTED_ERROR"
@@ -2968,6 +3213,16 @@ def run_ui(controller: Controller) -> int:
             for button in (toggle, refresh, doctor_button):
                 button.state(["disabled"])
             threading.Thread(target=worker, args=(kind,), daemon=True).start()
+
+        def open_log() -> None:
+            try:
+                _open_log_file(controller.log_path)
+            except Exception:
+                messagebox.showerror(
+                    "Open Log Failed",
+                    f"The manager log could not be opened.\n\nPath:\n{controller.log_path}",
+                )
+
 
         def restore_window() -> None:
             if closing["destroyed"]:
@@ -3030,7 +3285,7 @@ def run_ui(controller: Controller) -> int:
                     if report["healthy"]:
                         messagebox.showinfo(
                             "Troubleshoot and Logs",
-                            f"All safety checks passed.\n\nLog location:\n{controller.root / 'logs'}",
+                            f"All safety checks passed.\n\nLog file:\n{controller.log_path}",
                         )
                     else:
                         rendered = "\n".join(
@@ -3038,7 +3293,7 @@ def run_ui(controller: Controller) -> int:
                         )
                         messagebox.showwarning(
                             "Troubleshoot and Logs",
-                            f"{rendered}\n\nLog location:\n{controller.root / 'logs'}",
+                            f"{rendered}\n\nLog file:\n{controller.log_path}",
                         )
                     present(report["status"])
             elif not closing["requested"]:
@@ -3079,6 +3334,7 @@ def run_ui(controller: Controller) -> int:
         )
         refresh.configure(command=lambda: start("sync"))
         doctor_button.configure(command=lambda: start("doctor"))
+        open_log_button.configure(command=open_log)
         tray = NativeTrayIcon(
             on_open=lambda: tray_events.put("open"),
             on_check=lambda: tray_events.put("check"),
@@ -3139,7 +3395,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "sync":
             result = controller.sync(scheduled=args.scheduled)
         elif args.command == "status":
-            result = controller.bootstrap_status()
+            result = controller.observe_status()
         elif args.command == "doctor":
             report = controller.doctor()
             _console_print(
@@ -3164,3 +3420,4 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

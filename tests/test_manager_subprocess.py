@@ -164,7 +164,15 @@ class ManagerChildPythonContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        environment = mock.patch.dict(manager.os.environ, {"PATH": "test-path"}, clear=True)
+        environment = mock.patch.dict(
+            manager.os.environ,
+            {
+                "PATH": "test-path",
+                "OPENAI_API_KEY": "secret-openai",
+                "HF_TOKEN": "secret-hf",
+            },
+            clear=True,
+        )
         environment.start()
         self.addCleanup(environment.stop)
         self.root = Path(self.temporary.name).resolve()
@@ -213,6 +221,37 @@ class ManagerChildPythonContractTests(unittest.TestCase):
 
     def test_console_manager_passes_its_exact_console_python(self) -> None:
         self.assert_exact_console_python(self.invoke(self.python))
+
+    def test_runtime_guard_is_added_without_forwarding_other_secrets(self) -> None:
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout='{"jobId":"test-job"}\n',
+            stderr="",
+        )
+        with (
+            mock.patch.object(manager.sys, "executable", str(self.python)),
+            mock.patch.object(
+                manager.shutil,
+                "which",
+                return_value=r"C:\Program Files\PowerShell\7\pwsh.exe",
+            ),
+            mock.patch.object(manager.subprocess, "run", return_value=completed) as run,
+        ):
+            result = self.services.create_child(
+                self.installer,
+                r"C:\codex\codex.exe",
+                r"C:\runtime\guard.py",
+            )
+
+        self.assertEqual(result, {"jobId": "test-job"})
+        child_env = run.call_args.kwargs["env"]
+        self.assertEqual(child_env["PATH"], "test-path")
+        self.assertEqual(
+            child_env["CODEX_RESET_MANAGER_RUNTIME_GUARD"],
+            r"C:\runtime\guard.py",
+        )
+        self.assertNotIn("OPENAI_API_KEY", child_env)
+        self.assertNotIn("HF_TOKEN", child_env)
 
     def test_missing_sibling_pythonw_is_rejected_before_child_process(self) -> None:
         self.pythonw.unlink()

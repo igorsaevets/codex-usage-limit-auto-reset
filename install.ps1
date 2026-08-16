@@ -104,6 +104,150 @@ function Assert-WindowsPowerShell7 {
     }
 }
 
+function Get-SanitizedChildEnvironment {
+    param(
+        [Parameter()]
+        [hashtable] $Extra = @{}
+    )
+
+    $names = @(
+        'APPDATA',
+        'COMSPEC',
+        'HOMEDRIVE',
+        'HOMEPATH',
+        'LOCALAPPDATA',
+        'NUMBER_OF_PROCESSORS',
+        'OS',
+        'PATH',
+        'PATHEXT',
+        'PROCESSOR_ARCHITECTURE',
+        'PROCESSOR_IDENTIFIER',
+        'PROGRAMDATA',
+        'SYSTEMDRIVE',
+        'SYSTEMROOT',
+        'TEMP',
+        'TMP',
+        'USERNAME',
+        'USERPROFILE',
+        'WINDIR'
+    )
+    $environment = @{}
+    foreach ($name in $names) {
+        $value = [Environment]::GetEnvironmentVariable($name, 'Process')
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            $environment[$name] = $value
+        }
+    }
+    foreach ($entry in $Extra.GetEnumerator()) {
+        if ($null -eq $entry.Value) { continue }
+        $value = [string] $entry.Value
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            $environment[[string] $entry.Key] = $value
+        }
+    }
+    return $environment
+}
+
+function Invoke-WithScrubbedProcessEnvironment {
+    param(
+        [Parameter(Mandatory)]
+        [scriptblock] $Action,
+
+        [Parameter()]
+        [hashtable] $Environment = @{}
+    )
+
+    $original = @{}
+    foreach ($entry in [Environment]::GetEnvironmentVariables('Process').GetEnumerator()) {
+        $original[[string] $entry.Key] = [string] $entry.Value
+    }
+    $target = Get-SanitizedChildEnvironment -Extra $Environment
+    try {
+        foreach ($name in @([Environment]::GetEnvironmentVariables('Process').Keys)) {
+            [Environment]::SetEnvironmentVariable([string] $name, $null, 'Process')
+        }
+        foreach ($entry in $target.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable(
+                [string] $entry.Key,
+                [string] $entry.Value,
+                'Process'
+            )
+        }
+        return & $Action
+    }
+    finally {
+        foreach ($name in @([Environment]::GetEnvironmentVariables('Process').Keys)) {
+            [Environment]::SetEnvironmentVariable([string] $name, $null, 'Process')
+        }
+        foreach ($entry in $original.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable(
+                [string] $entry.Key,
+                [string] $entry.Value,
+                'Process'
+            )
+        }
+    }
+}
+
+function Start-ScrubbedHiddenProcess {
+    param(
+        [Parameter(Mandatory)][string] $FilePath,
+        [Parameter()][string[]] $ArgumentList = @(),
+        [Parameter()][string] $WorkingDirectory,
+        [Parameter()][switch] $PassThru,
+        [Parameter()][switch] $Wait,
+        [Parameter()][string] $Verb,
+        [Parameter()][hashtable] $Environment = @{}
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($Verb)) {
+        if ($Environment.Count -ne 0) {
+            throw 'Start-ScrubbedHiddenProcess cannot pass an explicit environment when -Verb is used.'
+        }
+        $startArgs = @{
+            FilePath    = $FilePath
+            ArgumentList = $ArgumentList
+            WindowStyle = 'Hidden'
+            Verb        = $Verb
+        }
+        if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+            $startArgs['WorkingDirectory'] = $WorkingDirectory
+        }
+        if ($PassThru) { $startArgs['PassThru'] = $true }
+        if ($Wait) { $startArgs['Wait'] = $true }
+        return Start-Process @startArgs
+    }
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+        $startInfo.WorkingDirectory = $WorkingDirectory
+    }
+    foreach ($argument in $ArgumentList) {
+        $null = $startInfo.ArgumentList.Add([string] $argument)
+    }
+    $startInfo.Environment.Clear()
+    foreach ($entry in (Get-SanitizedChildEnvironment -Extra $Environment).GetEnumerator()) {
+        $startInfo.Environment[[string] $entry.Key] = [string] $entry.Value
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw "Unable to start hidden process: $FilePath"
+    }
+    if ($Wait) {
+        $process.WaitForExit()
+    }
+    if ($PassThru) {
+        return $process
+    }
+    $process.Dispose()
+}
+
 function Resolve-CanonicalFile {
     param(
         [Parameter(Mandatory)]
@@ -153,7 +297,11 @@ print(json.dumps({
     "capabilities": capabilities,
 }, separators=(",", ":")))
 '@
-    $lines = @(& $Path -I -c $probeCode 2>$null)
+    $lines = @(
+        Invoke-WithScrubbedProcessEnvironment -Action {
+            & $Path -I -c $probeCode 2>$null
+        }
+    )
     if ($LASTEXITCODE -ne 0 -or $lines.Count -ne 1 -or
         [string]::IsNullOrWhiteSpace([string] $lines[0])) {
         throw 'Python capability probe failed.'
@@ -260,7 +408,9 @@ function Get-InstalledPythonCandidates {
     if ($null -ne $launcher -and -not [string]::IsNullOrWhiteSpace([string] $launcher.Source)) {
         # -0p only lists installed runtimes. Never use a version selector here:
         # newer launchers may install a missing runtime in response to one.
-        $listed = & $launcher.Source -0p 2>$null
+        $listed = Invoke-WithScrubbedProcessEnvironment -Action {
+            & $launcher.Source -0p 2>$null
+        }
         if ($LASTEXITCODE -eq 0) {
             foreach ($line in @($listed)) {
                 $match = [regex]::Match(
@@ -411,7 +561,9 @@ function Get-NpmNativeCodex {
             throw 'npm was not found; the native Codex executable must come from the global @openai/codex package.'
         }
 
-        $npmRootOutput = & $npm.Source root --global 2>$null
+        $npmRootOutput = Invoke-WithScrubbedProcessEnvironment -Action {
+            & $npm.Source root --global 2>$null
+        }
         if ($LASTEXITCODE -ne 0 -or $null -eq $npmRootOutput) {
             throw 'Unable to resolve the global npm package root.'
         }
@@ -467,7 +619,9 @@ function Get-NpmNativeCodex {
         throw 'The npm-native Codex executable does not have a valid OpenAI Authenticode signature.'
     }
 
-    $versionOutput = & $resolvedCodex --version 2>$null
+    $versionOutput = Invoke-WithScrubbedProcessEnvironment -Action {
+        & $resolvedCodex --version 2>$null
+    }
     if ($LASTEXITCODE -ne 0) {
         throw 'The npm-native Codex executable failed its version check.'
     }
@@ -524,9 +678,12 @@ catch {
 
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($elevatedScript))
     try {
-        $process = Start-Process -FilePath $pwsh `
+        $process = Start-ScrubbedHiddenProcess `
+            -FilePath $pwsh `
             -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded) `
-            -Verb RunAs -WindowStyle Hidden -Wait -PassThru
+            -Verb 'RunAs' `
+            -Wait `
+            -PassThru
     }
     catch {
         throw "Windows Time configuration was not authorized or could not start: $($_.Exception.Message)"
@@ -700,16 +857,13 @@ function Invoke-Guard {
         [string[]] $Arguments
     )
 
-    $oldValue = [Environment]::GetEnvironmentVariable($CodexPathEnvironmentVariable, 'Process')
-    try {
-        [Environment]::SetEnvironmentVariable($CodexPathEnvironmentVariable, $NativeCodex, 'Process')
-        & $Python $Runner @Arguments
-        if ($LASTEXITCODE -ne 0) {
-            throw "Guard command '$($Arguments[0])' failed with exit code $LASTEXITCODE."
+    Invoke-WithScrubbedProcessEnvironment `
+        -Environment @{ $CodexPathEnvironmentVariable = $NativeCodex } `
+        -Action {
+            & $Python $Runner @Arguments
         }
-    }
-    finally {
-        [Environment]::SetEnvironmentVariable($CodexPathEnvironmentVariable, $oldValue, 'Process')
+    if ($LASTEXITCODE -ne 0) {
+        throw "Guard command '$($Arguments[0])' failed with exit code $LASTEXITCODE."
     }
 }
 
@@ -1121,21 +1275,20 @@ function Invoke-Manager {
         [Parameter(Mandatory)][string[]] $Arguments
     )
 
-    $oldInstaller = [Environment]::GetEnvironmentVariable($RuntimeInstallerEnvironmentVariable, 'Process')
-    $oldGuard = [Environment]::GetEnvironmentVariable($RuntimeGuardEnvironmentVariable, 'Process')
-    try {
-        [Environment]::SetEnvironmentVariable($RuntimeInstallerEnvironmentVariable, $RuntimeInstaller, 'Process')
-        [Environment]::SetEnvironmentVariable($RuntimeGuardEnvironmentVariable, $RuntimeGuard, 'Process')
-        $output = @(& $Python $Manager @Arguments)
-        if ($LASTEXITCODE -ne 0) {
-            throw "Manager command '$($Arguments[0])' failed with exit code $LASTEXITCODE."
-        }
-        return $output
+    $output = @(
+        Invoke-WithScrubbedProcessEnvironment `
+            -Environment @{
+                $RuntimeInstallerEnvironmentVariable = $RuntimeInstaller
+                $RuntimeGuardEnvironmentVariable = $RuntimeGuard
+            } `
+            -Action {
+                & $Python $Manager @Arguments
+            }
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "Manager command '$($Arguments[0])' failed with exit code $LASTEXITCODE."
     }
-    finally {
-        [Environment]::SetEnvironmentVariable($RuntimeInstallerEnvironmentVariable, $oldInstaller, 'Process')
-        [Environment]::SetEnvironmentVariable($RuntimeGuardEnvironmentVariable, $oldGuard, 'Process')
-    }
+    return $output
 }
 
 function Get-FileByteSnapshot {
@@ -1511,13 +1664,19 @@ function Get-InstalledManagerUiProcesses {
     param([Parameter(Mandatory)][string] $InstallRoot)
 
     $runnersRoot = [IO.Path]::GetFullPath((Join-Path $InstallRoot 'runners'))
-    $pattern = '^\s*"(?<pythonw>[^"]*[\\/]pythonw\.exe)"\s+"(?<manager>[^"]+)"\s+ui\s*$'
+    $pattern = '^\s*"(?<pythonw>[^"]*[\\/]pythonw\.exe)"\s+(?:"(?<managerQuoted>[^"]+)"|(?<managerBare>\S+))\s+ui\s*$'
     $result = [Collections.Generic.List[object]]::new()
     foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" -ErrorAction Stop)) {
         if ([string]::IsNullOrWhiteSpace([string] $process.CommandLine)) { continue }
         $match = [regex]::Match([string] $process.CommandLine, $pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
         if (-not $match.Success) { continue }
-        $manager = Resolve-CanonicalFile -Path $match.Groups['manager'].Value -Description 'Running manager UI'
+        $managerPath = if ($match.Groups['managerQuoted'].Success) {
+            $match.Groups['managerQuoted'].Value
+        }
+        else {
+            $match.Groups['managerBare'].Value
+        }
+        $manager = Resolve-CanonicalFile -Path $managerPath -Description 'Running manager UI'
         if (-not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetDirectoryName($manager), $runnersRoot)) {
             continue
         }
@@ -1770,11 +1929,10 @@ function Assert-ReplacementManagerUi {
         throw "Exactly one verified replacement manager UI, owned lock, and fresh tray-ready marker did not appear ($lastReadyReason)."
     }
 
-    $secondary = Start-Process `
+    $secondary = Start-ScrubbedHiddenProcess `
         -FilePath $ExpectedPythonw `
-        -ArgumentList @((Quote-WindowsArgument $ExpectedManager), 'ui') `
+        -ArgumentList @($ExpectedManager, 'ui') `
         -WorkingDirectory $InstallRoot `
-        -WindowStyle Hidden `
         -PassThru
     try {
         Wait-Process -Id $secondary.Id -Timeout 10 -ErrorAction SilentlyContinue
@@ -1912,48 +2070,54 @@ if ($ManagerChildOnly) {
         -ObservedCodex $codex
 }
 
-$timeHealth = $null
-$timeFailure = $null
-try {
-    $timeHealth = Get-WindowsTimeHealth
-    if ($timeHealth.Source -notmatch '(?i)^time\.windows\.com(?:,0x9)?\s*$') {
-        throw "Windows Time source is '$($timeHealth.Source)', not time.windows.com,0x9."
+$verifyTimeNow = $ManagerChildOnly -or $ConfigureWindowsTime -or $InteractiveSetup
+if ($verifyTimeNow) {
+    $timeHealth = $null
+    $timeFailure = $null
+    try {
+        $timeHealth = Get-WindowsTimeHealth
+        if ($timeHealth.Source -notmatch '(?i)^time\.windows\.com(?:,0x9)?\s*$') {
+            throw "Windows Time source is '$($timeHealth.Source)', not time.windows.com,0x9."
+        }
     }
-}
-catch {
-    $timeFailure = $_.Exception.Message
-}
+    catch {
+        $timeFailure = $_.Exception.Message
+    }
 
-if ($null -ne $timeFailure) {
-    $repairTime = [bool] $ConfigureWindowsTime
-    if (-not $repairTime -and $InteractiveSetup) {
-        Write-Warning "Windows Time must be repaired before automatic use: $timeFailure"
-        $answer = Read-Host 'Configure time.windows.com now? Windows will show one UAC prompt. [Y/N]'
-        $repairTime = $answer -match '^(?i)y(?:es)?$'
-    }
-    if (-not $repairTime) {
-        throw "Windows Time verification failed: $timeFailure Rerun with -ConfigureWindowsTime, or double-click setup.cmd and approve repair."
-    }
-    if ($PSCmdlet.ShouldProcess('Windows Time service', 'Configure time.windows.com,0x9 and force resynchronization with elevation')) {
-        Invoke-ElevatedWindowsTimeConfiguration
-    }
-    for ($attempt = 1; $attempt -le 5; $attempt++) {
-        try {
-            $timeHealth = Get-WindowsTimeHealth
-            if ($timeHealth.Source -notmatch '(?i)^time\.windows\.com(?:,0x9)?\s*$') {
-                throw "Windows Time source remains '$($timeHealth.Source)'."
+    if ($null -ne $timeFailure) {
+        $repairTime = [bool] $ConfigureWindowsTime
+        if (-not $repairTime -and $InteractiveSetup) {
+            Write-Warning "Windows Time must be repaired before automatic use: $timeFailure"
+            $answer = Read-Host 'Configure time.windows.com now? Windows will show one UAC prompt. [Y/N]'
+            $repairTime = $answer -match '^(?i)y(?:es)?$'
+        }
+        if (-not $repairTime) {
+            throw "Windows Time verification failed: $timeFailure Rerun with -ConfigureWindowsTime, or double-click setup.cmd and approve repair."
+        }
+        if ($PSCmdlet.ShouldProcess('Windows Time service', 'Configure time.windows.com,0x9 and force resynchronization with elevation')) {
+            Invoke-ElevatedWindowsTimeConfiguration
+        }
+        for ($attempt = 1; $attempt -le 5; $attempt++) {
+            try {
+                $timeHealth = Get-WindowsTimeHealth
+                if ($timeHealth.Source -notmatch '(?i)^time\.windows\.com(?:,0x9)?\s*$') {
+                    throw "Windows Time source remains '$($timeHealth.Source)'."
+                }
+                $timeFailure = $null
+                break
             }
-            $timeFailure = $null
-            break
+            catch {
+                $timeFailure = $_.Exception.Message
+                if ($attempt -lt 5) { Start-Sleep -Seconds 2 }
+            }
         }
-        catch {
-            $timeFailure = $_.Exception.Message
-            if ($attempt -lt 5) { Start-Sleep -Seconds 2 }
-        }
+        if ($null -ne $timeFailure) { throw "Windows Time repair could not be verified: $timeFailure" }
     }
-    if ($null -ne $timeFailure) { throw "Windows Time repair could not be verified: $timeFailure" }
+    Write-Host "Windows Time source verified: $($timeHealth.Source)"
 }
-Write-Host "Windows Time source verified: $($timeHealth.Source)"
+else {
+    Write-Host 'Windows Time verification is deferred while automation remains paused. Enabling automation still requires a synchronized clock.'
+}
 
 if ($PSCmdlet.ShouldProcess($installRoot, 'Create private runtime directories')) {
     $null = New-Item -ItemType Directory -Path $installRoot -Force
@@ -2163,11 +2327,10 @@ if (-not $ManagerChildOnly) {
         }
 
         if ($PSCmdlet.ShouldProcess('Codex Usage Limit Reset Manager', 'Open the manager window once')) {
-            $replacementUiProcess = Start-Process `
+            $replacementUiProcess = Start-ScrubbedHiddenProcess `
                 -FilePath $python.WindowlessPath `
-                -ArgumentList @((Quote-WindowsArgument $runtimeManager), 'ui') `
+                -ArgumentList @($runtimeManager, 'ui') `
                 -WorkingDirectory $installRoot `
-                -WindowStyle Hidden `
                 -PassThru
         }
         if ($null -eq $replacementUiProcess) { throw 'The replacement manager UI was not launched.' }
@@ -2356,11 +2519,10 @@ if (-not $ManagerChildOnly) {
                     }
                     if ((Test-Path -LiteralPath $previous.Pythonw -PathType Leaf) -and
                         (Test-Path -LiteralPath $previous.Manager -PathType Leaf)) {
-                        $null = Start-Process `
+                        $null = Start-ScrubbedHiddenProcess `
                             -FilePath $previous.Pythonw `
-                            -ArgumentList @((Quote-WindowsArgument $previous.Manager), 'ui') `
-                            -WorkingDirectory $installRoot `
-                            -WindowStyle Hidden
+                            -ArgumentList @($previous.Manager, 'ui') `
+                            -WorkingDirectory $installRoot
                     }
                     else {
                         throw 'The previously verified manager UI runtime is no longer available.'
@@ -2492,7 +2654,7 @@ try {
         -DontStopIfGoingOnBatteries `
         -DisallowDemandStart `
         -MultipleInstances IgnoreNew `
-        -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 20) `
         -RestartCount 0
     $definition = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings
 

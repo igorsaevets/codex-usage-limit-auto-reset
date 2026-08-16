@@ -40,7 +40,7 @@ class ScheduledTaskContractTests(unittest.TestCase):
     <StartWhenAvailable>true</StartWhenAvailable>
     <Enabled>true</Enabled>
     <WakeToRun>true</WakeToRun>
-    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+    <ExecutionTimeLimit>PT20M</ExecutionTimeLimit>
   </Settings>
   <Actions><Exec><Command>{python}</Command><Arguments>{arguments}</Arguments><WorkingDirectory>{runner.parent.parent}</WorkingDirectory></Exec></Actions>
 </Task>"""

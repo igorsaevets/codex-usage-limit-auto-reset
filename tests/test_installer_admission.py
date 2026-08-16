@@ -798,7 +798,8 @@ class InstallerPythonRuntimeTests(unittest.TestCase):
         end = source.index("function ConvertTo-CompatiblePythonRuntime", start)
         body = source[start:end]
         self.assertIn("-I -c $probeCode", body)
-        self.assertIn("$lines = @(& $Path -I -c $probeCode", body)
+        self.assertIn("Invoke-WithScrubbedProcessEnvironment -Action {", body)
+        self.assertIn("& $Path -I -c $probeCode 2>$null", body)
         self.assertIn('get_config_var("Py_GIL_DISABLED")', body)
         for capability in ("tkinter.ttk", "WINFUNCTYPE", "msvcrt", "CREATE_NO_WINDOW"):
             self.assertIn(capability, body)
@@ -1260,6 +1261,10 @@ class InstallerSourceContractTests(unittest.TestCase):
         self.assertIn("DateTimeStyles]::AssumeUniversal", body)
         self.assertIn("DateTimeStyles]::AdjustToUniversal", body)
         self.assertIn("$all.Count -ne 1", body)
+        self.assertIn("managerQuoted", source)
+        self.assertIn("managerBare", source)
+        self.assertIn("$managerPath = if ($match.Groups['managerQuoted'].Success)", source)
+        self.assertIn("$match.Groups['managerBare'].Value", source)
         self.assertIn("$secondary.ExitCode -ne 0", body)
         self.assertIn("$PrimaryProcess.HasExited", body)
         self.assertIn("$lastReadyReason", body)

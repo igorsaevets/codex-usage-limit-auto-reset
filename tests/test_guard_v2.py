@@ -40,7 +40,12 @@ def rate_response() -> dict[str, object]:
                     "description": None,
                 }
             ],
-        }
+        },
+        "rateLimits": {
+            "primary": {
+                "resetsAt": 2_000_000_050,
+            },
+        },
     }
 
 
@@ -150,6 +155,8 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(row["expiresAt"], 2_000_000_100)
         self.assertEqual(row["grantedAt"], 1_900_000_000)
         self.assertNotIn(RAW_CREDIT_ID, json.dumps(result, sort_keys=True))
+        self.assertEqual(result["automaticLimitResetAt"], 2_000_000_050)
+        self.assertEqual(result["automaticLimitResetAtUtc"], guard._iso_utc(2_000_000_050))
 
     def test_helper_rejects_binary_change_during_read_only_validation(self) -> None:
         transport = ReadOnlyTransport()

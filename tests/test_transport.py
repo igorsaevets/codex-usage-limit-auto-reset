@@ -6,10 +6,14 @@ real Codex binary and never contact an account or consume a reset credit.
 
 from __future__ import annotations
 
+import io
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
+import codex_reset_guard as guard
 from codex_reset_guard import (
     AppServerTransport,
     CONSUME_METHOD,
@@ -129,6 +133,54 @@ class AppServerTransportTests(unittest.TestCase):
         account = transport.request("account/read", {"refreshToken": False})
 
         self.assertEqual(account["account"]["type"], "chatgpt")
+
+    def test_start_scrubs_secret_environment_variables_before_launch(self) -> None:
+        transport = self.transport(env={"FAKE_CHILD_FLAG": "1"})
+        fake_process = SimpleNamespace(
+            stdin=io.StringIO(),
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+            wait=mock.Mock(return_value=0),
+            terminate=mock.Mock(),
+            kill=mock.Mock(),
+            poll=mock.Mock(return_value=None),
+        )
+
+        def fake_thread(*args: object, **kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(start=lambda: None)
+
+        with (
+            mock.patch.dict(
+                guard.os.environ,
+                {
+                    "PATH": "test-path",
+                    "SYSTEMROOT": r"C:\Windows",
+                    "OPENAI_API_KEY": "secret-openai",
+                    "HF_TOKEN": "secret-hf",
+                },
+                clear=True,
+            ),
+            mock.patch.object(guard.subprocess, "Popen", return_value=fake_process) as popen,
+            mock.patch.object(guard.threading, "Thread", side_effect=fake_thread),
+            mock.patch.object(guard, "_validate_app_server_platform"),
+            mock.patch.object(
+                AppServerTransport,
+                "request",
+                return_value={"codexHome": str(FAKE_CODEX_HOME)},
+            ),
+            mock.patch.object(AppServerTransport, "notify"),
+        ):
+            initialized = transport.start()
+
+        self.assertEqual(initialized["codexHome"], str(FAKE_CODEX_HOME))
+        child_env = popen.call_args.kwargs["env"]
+        self.assertEqual(child_env["PATH"], "test-path")
+        self.assertEqual(child_env["SYSTEMROOT"], r"C:\Windows")
+        self.assertEqual(child_env["CODEX_HOME"], str(FAKE_CODEX_HOME))
+        self.assertEqual(child_env["CODEX_SQLITE_HOME"], str(FAKE_CODEX_HOME))
+        self.assertEqual(child_env["FAKE_CHILD_FLAG"], "1")
+        self.assertNotIn("OPENAI_API_KEY", child_env)
+        self.assertNotIn("HF_TOKEN", child_env)
 
 
 if __name__ == "__main__":

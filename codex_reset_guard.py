@@ -43,12 +43,13 @@ SUPPORTED_MANIFEST_SCHEMA_VERSIONS = {
     MANIFEST_SCHEMA_VERSION,
 }
 MINIMUM_CODEX_VERSION = (0, 144, 1)
-TASK_START_LEAD_SECONDS = 345
+TASK_START_LEAD_SECONDS = 17 * 60
 PROCESS_LEAD_SECONDS = 300
 CUTOFF_LEAD_SECONDS = 15
 ARM_MINIMUM_MARGIN_SECONDS = 600
 NOTHING_RETRY_SECONDS = 15
 MAX_AMBIGUOUS_REPLAYS = 2
+READ_ONLY_RETRY_DELAYS_SECONDS = (2.0, 4.0, 8.0, 15.0, 30.0, 30.0, 30.0)
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 15.0
 CONSUME_METHOD = "account/rateLimitResetCredit/consume"
 OFFICIAL_NPM_REGISTRY = "https://registry.npmjs.org/"
@@ -106,11 +107,75 @@ FAILURE_POST_DISPATCH_TIME = "POST_DISPATCH_TIME_SYNC"
 FAILURE_POST_DISPATCH_ACCOUNT = "POST_DISPATCH_ACCOUNT_MISMATCH"
 FAILURE_POST_DISPATCH_INVENTORY = "POST_DISPATCH_INVENTORY_INVALID"
 FAILURE_USER_CANCELLED = "USER_CANCELLED"
+WINDOWS_CHILD_ENV_ALLOWLIST = {
+    "APPDATA",
+    "COMSPEC",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "OS",
+    "PATH",
+    "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "PROGRAMDATA",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERNAME",
+    "USERPROFILE",
+    "WINDIR",
+}
+LINUX_CHILD_ENV_ALLOWLIST = {
+    "DBUS_SESSION_BUS_ADDRESS",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "USER",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+    "XDG_STATE_HOME",
+}
 
 
 def _subprocess_creationflags() -> int:
     """Hide child-process console windows while remaining portable."""
     return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
+def _child_process_environment(
+    *,
+    codex_home: Path | None = None,
+    extra: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    source = os.environ
+    allowed = LINUX_CHILD_ENV_ALLOWLIST if _is_linux() else WINDOWS_CHILD_ENV_ALLOWLIST
+    env: dict[str, str] = {}
+    for key in allowed:
+        value = source.get(key)
+        if isinstance(value, str) and value:
+            env[key] = value
+    if _is_linux():
+        env.setdefault("PATH", LINUX_LIVE_SYSTEM_PATH)
+    if codex_home is not None:
+        resolved_home = codex_home.expanduser().resolve()
+        env["CODEX_HOME"] = str(resolved_home)
+        env["CODEX_SQLITE_HOME"] = str(resolved_home)
+    if extra:
+        for key, value in extra.items():
+            if isinstance(value, str) and value:
+                env[key] = value
+    return env
 
 
 def _is_linux() -> bool:
@@ -963,9 +1028,10 @@ class AppServerTransport:
     def start(self) -> Mapping[str, Any]:
         if self.process is not None:
             raise GuardError("app-server is already running")
-        env = os.environ.copy()
-        env["CODEX_HOME"] = str(self.codex_home)
-        env.update(self.extra_env)
+        env = _child_process_environment(
+            codex_home=self.codex_home,
+            extra=self.extra_env,
+        )
         try:
             self.process = subprocess.Popen(
                 self.command,
@@ -1335,7 +1401,7 @@ def _validated_npm_launcher() -> Path:
 
 
 def _npm_execution_env(npm: Path, base: Mapping[str, str] | None = None) -> dict[str, str]:
-    env = dict(base if base is not None else os.environ)
+    env = dict(base if base is not None else _child_process_environment())
     current_path = env.get("PATH", "")
     entries = [entry for entry in current_path.split(os.pathsep) if entry]
     launcher_directory = str(npm.parent)
@@ -1466,6 +1532,7 @@ def _codex_version(exe: Path) -> str:
             errors="replace",
             timeout=15,
             check=False,
+            env=_child_process_environment(),
             creationflags=_subprocess_creationflags(),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -1482,8 +1549,6 @@ def _authenticode_subject(exe: Path) -> str:
     pwsh = shutil.which("pwsh") or shutil.which("powershell")
     if not pwsh:
         raise GuardError("PowerShell is required for Authenticode verification")
-    env = os.environ.copy()
-    env["CODEX_GUARD_VERIFY_PATH"] = str(exe)
     command = (
         "$s=Get-AuthenticodeSignature -LiteralPath $env:CODEX_GUARD_VERIFY_PATH;"
         "[pscustomobject]@{Status=[string]$s.Status;Subject=[string]$s.SignerCertificate.Subject}"
@@ -1497,7 +1562,7 @@ def _authenticode_subject(exe: Path) -> str:
         errors="replace",
         timeout=30,
         check=False,
-        env=env,
+        env=_child_process_environment(extra={"CODEX_GUARD_VERIFY_PATH": str(exe)}),
         creationflags=_subprocess_creationflags(),
     )
     if completed.returncode != 0:
@@ -1724,12 +1789,7 @@ def _validate_npm_audit_payload(
 
 
 def _isolated_npm_env(directory: Path, npm: Path) -> dict[str, str]:
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.upper().startswith("NPM_CONFIG_")
-        and key.upper() not in {"NODE_AUTH_TOKEN", "NPM_TOKEN"}
-    }
+    env = _child_process_environment()
     empty_user = directory / "empty-user.npmrc"
     empty_global = directory / "empty-global.npmrc"
     empty_user.write_text("", encoding="utf-8")
@@ -1928,6 +1988,8 @@ def _binary_info(exe: Path, *, verify_signature: bool = True) -> BinaryInfo:
 
 def _validate_cli_schema(exe: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="codex-reset-guard-schema-") as directory:
+        schema_home = Path(directory) / "codex-home"
+        schema_home.mkdir(parents=True, exist_ok=True)
         completed = subprocess.run(
             [str(exe), "app-server", "generate-json-schema", "--out", directory],
             capture_output=True,
@@ -1936,6 +1998,7 @@ def _validate_cli_schema(exe: Path) -> None:
             errors="replace",
             timeout=60,
             check=False,
+            env=_child_process_environment(codex_home=schema_home),
             creationflags=_subprocess_creationflags(),
         )
         if completed.returncode != 0:
@@ -1990,6 +2053,7 @@ def _time_status() -> str:
                 errors="replace",
                 timeout=20,
                 check=False,
+                env=_child_process_environment(),
                 creationflags=_subprocess_creationflags(),
             )
         except (OSError, subprocess.TimeoutExpired) as error:
@@ -2008,6 +2072,7 @@ def _time_status() -> str:
                 errors="replace",
                 timeout=20,
                 check=False,
+                env=_child_process_environment(),
                 creationflags=_subprocess_creationflags(),
             )
         except (OSError, subprocess.TimeoutExpired) as error:
@@ -2025,6 +2090,7 @@ def _time_status() -> str:
         errors="replace",
         timeout=20,
         check=False,
+        env=_child_process_environment(),
         creationflags=_subprocess_creationflags(),
     )
     output = (completed.stdout + "\n" + completed.stderr).strip()
@@ -2104,6 +2170,60 @@ def _safe_compatibility_rows(response: Mapping[str, Any]) -> list[dict[str, Any]
     return rows
 
 
+
+def _safe_primary_reset_epoch(response: Mapping[str, Any]) -> int | None:
+    rate_limits = response.get("rateLimits")
+    if not isinstance(rate_limits, Mapping):
+        return None
+    primary = rate_limits.get("primary")
+    if not isinstance(primary, Mapping):
+        return None
+    resets_at = primary.get("resetsAt")
+    if not _is_int(resets_at) or resets_at <= 0:
+        return None
+    return int(resets_at)
+
+
+def _safe_primary_used_percent(response: Mapping[str, Any]) -> float | None:
+    rate_limits = response.get("rateLimits")
+    if not isinstance(rate_limits, Mapping):
+        return None
+    primary = rate_limits.get("primary")
+    if not isinstance(primary, Mapping):
+        return None
+    used = primary.get("usedPercent")
+    if isinstance(used, (int, float)) and not isinstance(used, bool):
+        return float(used)
+    return None
+
+
+def _safe_primary_window_mins(response: Mapping[str, Any]) -> int | None:
+    rate_limits = response.get("rateLimits")
+    if not isinstance(rate_limits, Mapping):
+        return None
+    primary = rate_limits.get("primary")
+    if not isinstance(primary, Mapping):
+        return None
+    mins = primary.get("windowDurationMins")
+    if _is_int(mins) and mins > 0:
+        return int(mins)
+    return None
+
+
+def _safe_plan_type(response: Mapping[str, Any]) -> str | None:
+    rate_limits = response.get("rateLimits")
+    if isinstance(rate_limits, Mapping):
+        plan = rate_limits.get("planType")
+        if isinstance(plan, str) and plan:
+            return plan
+    account = response.get("account")
+    if isinstance(account, Mapping):
+        plan = account.get("planType")
+        if isinstance(plan, str) and plan:
+            return plan
+    return None
+
+
 def _stable_codex_version(version_output: str) -> tuple[int, int, int]:
     match = re.fullmatch(
         r"codex-cli (0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)",
@@ -2150,6 +2270,10 @@ def validate_cli_compatibility(
             validate_account_pin(account, expected_account_email_sha256)
         rates = _read_rate_limits(transport)
         rows = _safe_compatibility_rows(rates)
+        automatic_limit_reset_at = _safe_primary_reset_epoch(rates)
+        primary_used_percent = _safe_primary_used_percent(rates)
+        primary_window_mins = _safe_primary_window_mins(rates)
+        plan_type = _safe_plan_type(rates)
     if _is_linux():
         after_observed = observe_cli_pin(str(exe))
         after = BinaryInfo(
@@ -2183,6 +2307,15 @@ def validate_cli_compatibility(
         "accountEmailSha256": identity.email_sha256,
         "availableCount": len(rows),
         "credits": rows,
+        "automaticLimitResetAt": automatic_limit_reset_at,
+        "automaticLimitResetAtUtc": (
+            _iso_utc(automatic_limit_reset_at)
+            if automatic_limit_reset_at is not None
+            else None
+        ),
+        "primaryUsedPercent": primary_used_percent,
+        "primaryWindowDurationMins": primary_window_mins,
+        "planType": plan_type,
     }
 
 
@@ -2227,8 +2360,9 @@ def _systemctl_user(
     systemctl = shutil.which("systemctl")
     if not systemctl:
         raise GuardError("systemctl is required for Linux scheduled jobs")
-    env = os.environ.copy()
-    env.update({"LC_ALL": "C", "SYSTEMD_COLORS": "0", "SYSTEMD_PAGER": "cat"})
+    env = _child_process_environment(
+        extra={"LC_ALL": "C", "SYSTEMD_COLORS": "0", "SYSTEMD_PAGER": "cat"}
+    )
     try:
         return subprocess.run(
             [systemctl, "--user", *arguments],
@@ -2401,6 +2535,7 @@ def _disable_task_best_effort(task_name: str | None) -> bool:
         errors="replace",
         timeout=20,
         check=False,
+        env=_child_process_environment(),
         creationflags=_subprocess_creationflags(),
     )
     return completed.returncode == 0
@@ -2438,6 +2573,7 @@ def _delete_task_best_effort(task_name: str | None) -> bool:
         errors="replace",
         timeout=20,
         check=False,
+        env=_child_process_environment(),
         creationflags=_subprocess_creationflags(),
     )
     return completed.returncode == 0
@@ -2456,6 +2592,7 @@ def _validate_task_exists(task_name: str) -> None:
         errors="replace",
         timeout=20,
         check=False,
+        env=_child_process_environment(),
         creationflags=_subprocess_creationflags(),
     )
     if completed.returncode != 0:
@@ -2584,7 +2721,7 @@ def _validate_systemd_task_contract(
     expected_service = {
         "Type": "oneshot",
         "Restart": "no",
-        "TimeoutStartSec": "10min",
+        "TimeoutStartSec": "20min",
         "UMask": "0077",
         "NoNewPrivileges": "yes",
     }
@@ -2692,6 +2829,7 @@ def _validate_scheduled_task_contract(
         errors="replace",
         timeout=20,
         check=False,
+        env=_child_process_environment(),
         creationflags=_subprocess_creationflags(),
     )
     if completed.returncode != 0:
@@ -2750,7 +2888,7 @@ def _validate_scheduled_task_contract(
         "MultipleInstancesPolicy": "IgnoreNew",
         "DisallowStartIfOnBatteries": "false",
         "StopIfGoingOnBatteries": "false",
-        "ExecutionTimeLimit": "PT10M",
+        "ExecutionTimeLimit": "PT20M",
     }
     for name, expected in required_settings.items():
         if _xml_text(settings, name) != expected:
@@ -2947,11 +3085,47 @@ def _run_guard_impl(
                 return None
 
         transport = transport_factory(exe, codex_home)
+
+        def read_validated_context(
+            *,
+            start_transport: bool,
+        ) -> tuple[Mapping[str, Any], Mapping[str, Any], str] | None:
+            """Read and validate live state, retrying only side-effect-free RPCs."""
+            for attempt in range(len(READ_ONLY_RETRY_DELAYS_SECONDS) + 1):
+                if live and _cancellation_requested(manifest_path, manifest):
+                    return None
+                try:
+                    if start_transport and attempt == 0:
+                        transport.start()
+                    elif attempt > 0:
+                        transport.restart()
+                    account_response = _read_account(transport)
+                    rate_limit_response = _read_rate_limits(transport)
+                    credit_id = _validate_live_context(
+                        manifest, account_response, rate_limit_response
+                    )
+                    return account_response, rate_limit_response, credit_id
+                except (TransportError, RpcError) as error:
+                    if not live or attempt >= len(READ_ONLY_RETRY_DELAYS_SECONDS):
+                        raise
+                    delay = READ_ONLY_RETRY_DELAYS_SECONDS[attempt]
+                    if now_func() + delay >= cutoff:
+                        raise
+                    _log_event(
+                        manifest_path,
+                        manifest,
+                        "read-only-retry",
+                        attempt=attempt + 1,
+                        failureType=type(error).__name__,
+                    )
+                    sleeper(delay)
+            raise GuardError("internal read-only retry state is invalid")
+
         try:
-            transport.start()
-            account = _read_account(transport)
-            rate_limits = _read_rate_limits(transport)
-            raw_credit_id = _validate_live_context(manifest, account, rate_limits)
+            context = read_validated_context(start_transport=True)
+            if context is None:
+                return _finish_cancelled(manifest_path, manifest)
+            account, rate_limits, raw_credit_id = context
             if not live:
                 _log_event(
                     manifest_path,
@@ -2980,9 +3154,10 @@ def _run_guard_impl(
                     _disable_task_best_effort(manifest["task"]["name"])
                     return RunResult("NO_ACTION", outcome="nothingToReset")
 
-                account = _read_account(transport)
-                rate_limits = _read_rate_limits(transport)
-                raw_credit_id = _validate_live_context(manifest, account, rate_limits)
+                context = read_validated_context(start_transport=False)
+                if context is None:
+                    return _finish_cancelled(manifest_path, manifest)
+                account, rate_limits, raw_credit_id = context
                 verify_live_clock()
                 if _cancellation_requested(manifest_path, manifest):
                     return _finish_cancelled(manifest_path, manifest)
@@ -3134,6 +3309,33 @@ def _run_guard_impl(
                     )
                     _log_event(manifest_path, manifest, "succeeded", outcome=outcome)
                     _disable_task_best_effort(manifest["task"]["name"])
+                    try:
+                        refreshed = _read_rate_limits(transport)
+                        summary = refreshed.get("rateLimitResetCredits")
+                        if not isinstance(summary, Mapping):
+                            raise ProtocolError(
+                                "post-success usage limit reset summary is missing"
+                            )
+                        available_count = summary.get("availableCount")
+                        if not _is_int(available_count) or available_count < 0:
+                            raise ProtocolError(
+                                "post-success availableCount is invalid"
+                            )
+                        with contextlib.suppress(OSError):
+                            _log_event(
+                                manifest_path,
+                                manifest,
+                                "post-success-refresh",
+                                availableCount=available_count,
+                            )
+                    except (TransportError, RpcError, ProtocolError) as error:
+                        with contextlib.suppress(OSError):
+                            _log_event(
+                                manifest_path,
+                                manifest,
+                                "post-success-refresh-failed",
+                                failureType=type(error).__name__,
+                            )
                     return RunResult("SUCCEEDED", outcome=outcome)
                 if classification == "abort":
                     _update_manifest_state(
@@ -3198,6 +3400,11 @@ def _run_guard_impl(
                     _wait_until(
                         int(retry_at.timestamp()), sleeper=sleeper, now_func=now_func
                     )
+                    # A definitive nothingToReset completes this logical
+                    # attempt.  The next freshly validated attempt gets a new
+                    # UUID; ambiguous transport/RPC replays above keep the
+                    # original UUID.
+                    idempotency_key = str(uuid.uuid4())
                     had_ambiguous = False
                     continue
                 raise GuardError("internal consume state is invalid")
@@ -3305,6 +3512,7 @@ def _probe(exe: Path, codex_home: Path) -> dict[str, Any]:
         earliest = select_unique_earliest_credit(rates)
         pin = make_target_pin(earliest)
         rows = _safe_probe_rows(rates)
+        automatic_limit_reset_at = _safe_primary_reset_epoch(rates)
     return {
         "binary": {
             "path": binary.path,
@@ -3315,6 +3523,12 @@ def _probe(exe: Path, codex_home: Path) -> dict[str, Any]:
         "accountEmailSha256": identity.email_sha256,
         "availableCount": len(rows),
         "credits": rows,
+        "automaticLimitResetAt": automatic_limit_reset_at,
+        "automaticLimitResetAtUtc": (
+            _iso_utc(automatic_limit_reset_at)
+            if automatic_limit_reset_at is not None
+            else None
+        ),
         "recommended": {
             "creditHashPrefix": pin["creditIdSha256"][:12],
             "expiresAtUtc": _iso_utc(pin["expiresAt"]),

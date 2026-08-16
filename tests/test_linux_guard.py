@@ -570,7 +570,7 @@ ExecStart={exec_start}
 WorkingDirectory={working}
 Environment="PATH=/usr/bin:/bin"
 Restart=no
-TimeoutStartSec=10min
+TimeoutStartSec=20min
 UMask=0077
 NoNewPrivileges=yes
 """

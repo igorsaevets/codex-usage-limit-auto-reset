@@ -18,6 +18,7 @@ class ManagerConsoleOutputTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.controller = mock.Mock()
         self.controller.sync.return_value = {"automation": "on"}
+        self.controller.observe_status.return_value = {"automation": "on"}
         self.controller.bootstrap_status.return_value = {"automation": "on"}
         self.controller.doctor.return_value = {
             "healthy": True,
@@ -44,7 +45,7 @@ class ManagerConsoleOutputTests(unittest.TestCase):
             exit_code = self.run_main(["status", "--json"])
 
         self.assertEqual(exit_code, 0)
-        self.controller.bootstrap_status.assert_called_once_with()
+        self.controller.observe_status.assert_called_once_with()
 
     def test_doctor_preserves_result_exit_code_without_stdout(self) -> None:
         with mock.patch.object(manager.sys, "stdout", None):
@@ -82,9 +83,9 @@ class ManagerConsoleOutputTests(unittest.TestCase):
         )
 
     def test_console_status_uses_reset_terminology(self) -> None:
-        self.controller.bootstrap_status.return_value = {
+        self.controller.observe_status.return_value = {
             "automation": "on",
-            "nextExpiresAtUtc": "2030-01-01T01:00:00Z",
+            "freeResetExpiresAtUtc": "2030-01-01T01:00:00Z",
         }
         output = io.StringIO()
 
@@ -93,7 +94,8 @@ class ManagerConsoleOutputTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         expected_time = manager._local_time(manager._utc_epoch("2030-01-01T01:00:00Z"))
-        self.assertIn(f"Next reset expires: {expected_time}", output.getvalue())
+        self.assertIn("Free reset expires:", output.getvalue())
+        self.assertIn(expected_time, output.getvalue())
         self.assertNotIn("credit", output.getvalue().casefold())
 
     def test_cli_help_uses_usage_limit_reset_product_name(self) -> None:
@@ -116,3 +118,4 @@ class ManagerConsoleOutputTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

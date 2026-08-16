@@ -14,7 +14,9 @@ from typing import Any, Mapping
 from codex_reset_guard import (
     CONSUME_METHOD,
     GuardError,
+    READ_ONLY_RETRY_DELAYS_SECONDS,
     RpcError,
+    TASK_START_LEAD_SECONDS,
     TransportError,
     hash_account_email,
     run_guard,
@@ -87,10 +89,13 @@ class FakeTransport:
         self,
         *,
         consume_actions: list[object] | None = None,
-        rate_responses: list[Mapping[str, Any]] | None = None,
+        rate_responses: list[object] | None = None,
     ) -> None:
         self.consume_actions = list(consume_actions or [])
-        self.rate_responses = [copy.deepcopy(item) for item in (rate_responses or [rate_response()])]
+        self.rate_responses = [
+            item if isinstance(item, BaseException) else copy.deepcopy(item)
+            for item in (rate_responses or [rate_response()])
+        ]
         self.requests: list[tuple[str, object, float | None]] = []
         self.starts = 0
         self.restarts = 0
@@ -126,7 +131,10 @@ class FakeTransport:
         if method == "account/rateLimits/read":
             index = min(self.rate_reads, len(self.rate_responses) - 1)
             self.rate_reads += 1
-            return copy.deepcopy(self.rate_responses[index])
+            action = self.rate_responses[index]
+            if isinstance(action, BaseException):
+                raise action
+            return copy.deepcopy(action)
         if method == CONSUME_METHOD:
             if not self.consume_actions:
                 raise AssertionError("unexpected consume request")
@@ -175,7 +183,7 @@ class RunLoopTests(unittest.TestCase):
                 "signerSubject": "CN=OpenAI, L.L.C.",
             },
             "schedule": {
-                "triggerAtUtc": iso_utc(EXPIRY - 345),
+                "triggerAtUtc": iso_utc(EXPIRY - TASK_START_LEAD_SECONDS),
                 "processAtUtc": iso_utc(EXPIRY - 300),
                 "cutoffAtUtc": iso_utc(EXPIRY - 15),
                 "expiresAtUtc": iso_utc(EXPIRY),
@@ -245,7 +253,12 @@ class RunLoopTests(unittest.TestCase):
         return result, created
 
     def assert_exact_consume_params(
-        self, fake: FakeTransport, count: int, *, expected_key: str | None = IDEMPOTENCY_KEY
+        self,
+        fake: FakeTransport,
+        count: int,
+        *,
+        expected_key: str | None = IDEMPOTENCY_KEY,
+        same_key: bool = True,
     ) -> None:
         params = fake.consume_params()
         self.assertEqual(len(params), count)
@@ -255,7 +268,8 @@ class RunLoopTests(unittest.TestCase):
             self.assertEqual(uuid.UUID(item["idempotencyKey"]).version, 4)
             if expected_key is not None:
                 self.assertEqual(item["idempotencyKey"], expected_key)
-        self.assertTrue(all(item == params[0] for item in params))
+        if same_key:
+            self.assertTrue(all(item == params[0] for item in params))
 
     def test_dry_run_validates_but_never_sends_consume(self) -> None:
         self.write_manifest(armed=False, state="ENROLLED")
@@ -280,6 +294,7 @@ class RunLoopTests(unittest.TestCase):
 
         self.assertEqual((result.state, result.outcome), ("SUCCEEDED", "reset"))
         self.assert_exact_consume_params(fake, 1)
+        self.assertEqual(fake.rate_reads, 3)  # initial + before POST + post-success
         stored = self.read_manifest()
         self.assertEqual(stored["state"], "SUCCEEDED")
         self.assertFalse(stored["armed"])
@@ -300,8 +315,76 @@ class RunLoopTests(unittest.TestCase):
 
         self.assertEqual((result.state, result.outcome), ("SUCCEEDED", "reset"))
         self.assertEqual(clock.sleeps, [14.0])
-        self.assertEqual(fake.rate_reads, 3)  # initial + before each POST
-        self.assert_exact_consume_params(fake, 2)
+        self.assertEqual(fake.rate_reads, 4)  # initial + before each POST + post-success
+        self.assert_exact_consume_params(
+            fake, 2, expected_key=None, same_key=False
+        )
+        params = fake.consume_params()
+        self.assertEqual(params[0]["idempotencyKey"], IDEMPOTENCY_KEY)
+        self.assertNotEqual(
+            params[0]["idempotencyKey"], params[1]["idempotencyKey"]
+        )
+
+    def test_transient_read_only_preflight_error_restarts_without_extra_consume(
+        self,
+    ) -> None:
+        self.write_manifest(armed=True, state="ARMED")
+        fake = FakeTransport(
+            consume_actions=[{"outcome": "reset"}],
+            rate_responses=[
+                TransportError("fake transient read timeout", after_write=True),
+                rate_response(),
+            ],
+        )
+        clock = FakeClock(EXPIRY - 300)
+
+        result, _created = self.run_with(fake, clock, live=True)
+
+        self.assertEqual((result.state, result.outcome), ("SUCCEEDED", "reset"))
+        self.assertEqual(clock.sleeps, [2.0])
+        self.assertEqual(fake.restarts, 1)
+        self.assertEqual(fake.rate_reads, 4)
+        self.assert_exact_consume_params(fake, 1)
+
+    def test_read_only_preflight_retry_exhaustion_never_consumes(self) -> None:
+        self.write_manifest(armed=True, state="ARMED")
+        fake = FakeTransport(
+            consume_actions=[{"outcome": "reset"}],
+            rate_responses=[
+                TransportError("fake persistent read timeout", after_write=True)
+            ],
+        )
+        clock = FakeClock(EXPIRY - 300)
+
+        with self.assertRaises(TransportError):
+            self.run_with(fake, clock, live=True)
+
+        self.assertEqual(clock.sleeps, list(READ_ONLY_RETRY_DELAYS_SECONDS))
+        self.assertEqual(fake.consume_params(), [])
+        stored = self.read_manifest()
+        self.assertEqual(stored["state"], "FAILED")
+        self.assertFalse(stored["armed"])
+
+    def test_post_success_refresh_failure_does_not_change_success_or_reconsume(
+        self,
+    ) -> None:
+        self.write_manifest(armed=True, state="ARMED")
+        fake = FakeTransport(
+            consume_actions=[{"outcome": "reset"}],
+            rate_responses=[
+                rate_response(),
+                rate_response(),
+                TransportError("fake post-success timeout", after_write=True),
+            ],
+        )
+        clock = FakeClock(EXPIRY - 300)
+
+        result, _created = self.run_with(fake, clock, live=True)
+
+        self.assertEqual((result.state, result.outcome), ("SUCCEEDED", "reset"))
+        self.assertEqual(fake.rate_reads, 3)
+        self.assert_exact_consume_params(fake, 1)
+        self.assertEqual(self.read_manifest()["state"], "SUCCEEDED")
 
     def test_ambiguous_timeout_then_already_redeemed_is_success(self) -> None:
         self.write_manifest(armed=True, state="ARMED")
@@ -455,6 +538,10 @@ class RunLoopTests(unittest.TestCase):
             "noCredit": [
                 TransportError("fake timeout", after_write=True),
                 {"outcome": "noCredit"},
+            ],
+            "nothingToReset": [
+                TransportError("fake timeout", after_write=True),
+                {"outcome": "nothingToReset"},
             ],
             "unknown": [
                 TransportError("fake timeout", after_write=True),

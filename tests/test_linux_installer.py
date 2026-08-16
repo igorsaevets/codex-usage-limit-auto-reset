@@ -115,7 +115,7 @@ class LinuxInstallerUnitTests(unittest.TestCase):
             self.assertNotIn(f'WorkingDirectory="{root}"\n', service)
             self.assertIn("RefuseManualStart=yes\n", service)
             self.assertIn("Restart=no\n", service)
-            self.assertIn("TimeoutStartSec=10min\n", service)
+            self.assertIn("TimeoutStartSec=20min\n", service)
             self.assertIn("UMask=0077\n", service)
             self.assertIn("NoNewPrivileges=yes\n", service)
             self.assertIn('"run" "--manifest"', service)
@@ -323,12 +323,22 @@ class LinuxInstallerUnitTests(unittest.TestCase):
                 installer, "_validate_npm_launcher", return_value=interactive
             ):
                 self.assertEqual(installer._select_npm(layout, None), interactive)
-            with mock.patch.dict(os.environ, {"PATH": "/different/interactive/path"}):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "PATH": "/different/interactive/path",
+                    "OPENAI_API_KEY": "secret-openai",
+                    "HF_TOKEN": "secret-hf",
+                },
+                clear=True,
+            ):
                 environment = installer._pinned_npm_environment(interactive)
             self.assertEqual(environment["CODEX_RESET_NPM"], str(interactive))
             self.assertEqual(
                 environment["PATH"], installer._deterministic_path(interactive)
             )
+            self.assertNotIn("OPENAI_API_KEY", environment)
+            self.assertNotIn("HF_TOKEN", environment)
 
     def test_npm_launcher_keeps_launcher_path_and_requires_same_dir_node(self) -> None:
         with self.assertRaisesRegex(installer.InstallError, "absolute path named npm"):
@@ -400,11 +410,42 @@ class LinuxInstallerUnitTests(unittest.TestCase):
             root = Path(temporary)
             npm = Path("/opt/node/bin/npm")
             completed = types.SimpleNamespace(stdout=str(root) + "\n")
-            with mock.patch.object(installer, "_run", return_value=completed) as run:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "PATH": "/interactive/bin",
+                    "OPENAI_API_KEY": "secret-openai",
+                    "HF_TOKEN": "secret-hf",
+                },
+                clear=True,
+            ), mock.patch.object(installer, "_run", return_value=completed) as run:
                 self.assertEqual(installer._npm_root(npm), root.resolve())
             environment = run.call_args.kwargs["env"]
             self.assertEqual(environment["CODEX_RESET_NPM"], str(npm))
             self.assertEqual(environment["PATH"], installer._deterministic_path(npm))
+            self.assertNotIn("OPENAI_API_KEY", environment)
+            self.assertNotIn("HF_TOKEN", environment)
+
+    def test_run_defaults_to_scrubbed_child_environment(self) -> None:
+        completed = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PATH": "/interactive/bin",
+                "HOME": "/home/tester",
+                "OPENAI_API_KEY": "secret-openai",
+                "HF_TOKEN": "secret-hf",
+            },
+            clear=True,
+        ), mock.patch.object(installer.subprocess, "run", return_value=completed) as run:
+            observed = installer._run(["/usr/bin/env"], check=False)
+
+        self.assertIs(observed, completed)
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(environment["PATH"], "/interactive/bin")
+        self.assertEqual(environment["HOME"], "/home/tester")
+        self.assertNotIn("OPENAI_API_KEY", environment)
+        self.assertNotIn("HF_TOKEN", environment)
 
     def test_python_admission_accepts_final_gil_base_311_and_future(self) -> None:
         base = {

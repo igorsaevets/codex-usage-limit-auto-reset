@@ -201,6 +201,20 @@ class _Controller:
         self.root = root
         self.state_dir = root / "state"
         self.operations: list[str] = []
+        self.observe_result = {
+            "automation": "paused",
+            "enabled": False,
+            "automaticLimitResetAtUtc": "2030-01-01T05:00:00Z",
+            "freeResetExpiresAtUtc": "2030-01-01T09:00:00Z",
+            "cliStatus": "compatible",
+            "timeStatus": "synchronized",
+            "lastResult": None,
+            "reservationStatus": "none",
+            "blockedCode": None,
+        }
+
+    def observe_status(self) -> object:
+        return self.observe_result
 
     def __getattr__(self, name: str) -> object:
         if name in {"enable", "pause", "sync", "doctor", "bootstrap_status"}:
@@ -302,9 +316,9 @@ class ManagerUiIntegrationTests(unittest.TestCase):
     def test_modern_client_dimensions_styles_and_footer(self) -> None:
         root, _, _ = self._run(tray_starts=False)
 
-        self.assertEqual(root.title_value, "Codex Usage Limit Reset Manager")
-        self.assertEqual(root.geometry_value, "600x430")
-        self.assertEqual(root.minsize_value, (560, 400))
+        self.assertEqual(root.title_value, f"Codex Usage Limit Reset Manager v{manager.APP_VERSION}")
+        self.assertEqual(root.geometry_value, "640x490")
+        self.assertEqual(root.minsize_value, (600, 450))
         self.assertEqual(root.options["background"], "#FFFFFF")
         assert _Style.instance is not None
         styles = _Style.instance.configurations
@@ -324,12 +338,19 @@ class ManagerUiIntegrationTests(unittest.TestCase):
             for widget in _Widget.instances
             if "text" in widget.options
         }
-        self.assertIn("Codex Usage Limit Reset Manager", visible_text)
-        self.assertIn(
-            "Safely uses one selected usage limit reset about five minutes before it expires.",
-            visible_text,
+        self.assertTrue(any("Codex Usage Limit Reset Manager" in t for t in visible_text))
+        self.assertIn("Current usage", visible_text)
+        self.assertIn("Automatic limit reset", visible_text)
+        self.assertIn("Free reset expires", visible_text)
+        self.assertIn("Open Log", visible_text)
+        self.assertIn("Troubleshoot", visible_text)
+        self.assertNotIn("Next reset expires", visible_text)
+        self.assertTrue(
+            any(
+                "Safely uses one selected usage limit reset about five minutes before it expires." in t
+                for t in visible_text
+            )
         )
-        self.assertIn("Next reset expires", visible_text)
         self.assertNotIn("Codex Reset Credit Manager", visible_text)
 
     def test_status_text_tones_are_semantic_and_supplemental(self) -> None:

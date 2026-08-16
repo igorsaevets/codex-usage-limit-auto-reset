@@ -513,6 +513,17 @@ class LinuxSystemdServicesTests(unittest.TestCase):
             stderr="",
         )
         with (
+            mock.patch.object(manager.sys, "platform", "linux"),
+            mock.patch.dict(
+                manager.os.environ,
+                {
+                    "PATH": "/usr/bin:/bin",
+                    "HOME": "/home/tester",
+                    "OPENAI_API_KEY": "secret-openai",
+                    "HF_TOKEN": "secret-hf",
+                },
+                clear=True,
+            ),
             mock.patch.object(manager, "_manager_console_python", return_value=python),
             mock.patch.object(manager.subprocess, "run", return_value=completed) as run,
         ):
@@ -540,6 +551,11 @@ class LinuxSystemdServicesTests(unittest.TestCase):
             ],
         )
         self.assertEqual(run.call_args.kwargs["timeout"], 600)
+        child_env = run.call_args.kwargs["env"]
+        self.assertEqual(child_env["PATH"], "/usr/bin:/bin")
+        self.assertEqual(child_env["HOME"], "/home/tester")
+        self.assertNotIn("OPENAI_API_KEY", child_env)
+        self.assertNotIn("HF_TOKEN", child_env)
 
 
 class LinuxElapsedTimerControllerTests(unittest.TestCase):
@@ -698,7 +714,9 @@ class LinuxChildCleanupTests(unittest.TestCase):
                 "signerSubject": "npm-provenance:test",
             },
             "schedule": {
-                "triggerAtUtc": manager._utc_text(self.credit.expires_at - 345),
+                "triggerAtUtc": manager._utc_text(
+                    self.credit.expires_at - manager.TASK_START_LEAD_SECONDS
+                ),
                 "processAtUtc": manager._utc_text(self.credit.expires_at - 300),
                 "cutoffAtUtc": manager._utc_text(self.credit.expires_at - 15),
                 "expiresAtUtc": manager._utc_text(self.credit.expires_at),

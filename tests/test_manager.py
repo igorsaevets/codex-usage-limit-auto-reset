@@ -27,6 +27,7 @@ from codex_reset_manager import (
 
 
 NOW = 2_000_000_000
+AUTO_LIMIT_RESET = NOW + 4_321
 ACCOUNT_HASH = hashlib.sha256(b"person@example.test").hexdigest()
 CLI_HASH = "a" * 64
 
@@ -41,7 +42,12 @@ def credit(name: str, expires_at: int, *, granted_at: int | None = None) -> dict
     }
 
 
-def snapshot(rows: list[dict[str, Any]], *, cli_hash: str = CLI_HASH) -> dict[str, Any]:
+def snapshot(
+    rows: list[dict[str, Any]],
+    *,
+    cli_hash: str = CLI_HASH,
+    automatic_limit_reset_at: int | None = AUTO_LIMIT_RESET,
+) -> dict[str, Any]:
     return {
         "compatible": True,
         "binary": {
@@ -53,6 +59,12 @@ def snapshot(rows: list[dict[str, Any]], *, cli_hash: str = CLI_HASH) -> dict[st
         "accountEmailSha256": ACCOUNT_HASH,
         "availableCount": len(rows),
         "credits": rows,
+        "automaticLimitResetAt": automatic_limit_reset_at,
+        "automaticLimitResetAtUtc": (
+            _utc_text(automatic_limit_reset_at)
+            if automatic_limit_reset_at is not None
+            else None
+        ),
     }
 
 
@@ -97,7 +109,7 @@ def write_manifest(
             "signerSubject": "CN=OpenAI, L.L.C.",
         },
         "schedule": {
-            "triggerAtUtc": _utc_text(expires - 345),
+            "triggerAtUtc": _utc_text(expires - 17 * 60),
             "processAtUtc": _utc_text(expires - 300),
             "cutoffAtUtc": _utc_text(expires - 15),
             "expiresAtUtc": _utc_text(expires),
@@ -249,6 +261,24 @@ class ManagerControllerTests(unittest.TestCase):
         stored = self.policy()
         self.assertEqual(stored["currentJob"]["manifestPath"], str(existing.resolve()))
         self.assertFalse(stored["enabled"])
+
+    def test_manual_sync_while_paused_performs_live_read_and_logs_observation(self) -> None:
+        status = self.controller.sync()
+
+        self.assertEqual(status["automation"], "paused")
+        self.assertFalse(status["enabled"])
+        self.assertEqual(status["cliStatus"], "compatible")
+        self.assertEqual(status["freeResetExpiresAtUtc"], _utc_text(self.first["expiresAt"]))
+        self.assertEqual(status["automaticLimitResetAtUtc"], _utc_text(AUTO_LIMIT_RESET))
+        self.assertEqual(self.services.created, 0)
+        self.assertEqual(self.services.cli_validations, 1)
+        log_path = self.root / "logs" / "manager.jsonl"
+        self.assertTrue(log_path.is_file())
+        rendered = log_path.read_text(encoding="utf-8")
+        self.assertIn("\"event\": \"status\"", rendered)
+        self.assertIn(status["freeResetExpiresAtUtc"], rendered)
+        self.assertIn(status["automaticLimitResetAtUtc"], rendered)
+
 
     def test_enable_preserves_existing_job_and_validates_task(self) -> None:
         path = write_manifest(self.root, self.first, schema=1, suffix="existing-v1")

@@ -57,7 +57,12 @@ New Linux installations start paused. Use the full wrapper path immediately afte
 
 `ManagerSync` runs at Windows sign-in or about one minute after the Linux user manager starts, then every 30 minutes. It checks the account, clock, Codex CLI, and complete list of resets, maintains at most one reservation, and never uses a reset.
 
-One exact-ID, one-shot task starts shortly beforehand and uses the reset at about T−5 minutes. It can use only the selected reset and never falls back. Because synchronization runs every 30 minutes, automatic discovery is guaranteed only when a new reset appears with about **46 minutes** remaining. If the controller discovers it too close to expiry, it does not create a rushed live task.
+One exact-ID, one-shot task starts at about T−17 minutes, performs only read-only validation while it waits, and uses the reset at about T−5 minutes. It can use only the selected reset and never falls back. The earlier start leaves room for Windows `StartWhenAvailable` wake delay and bounded read-only transport retries. Because synchronization runs every 30 minutes, automatic discovery is guaranteed only when a new reset appears with about **57 minutes** remaining. If the controller discovers it too close to expiry, it does not create a rushed live task.
+
+The Windows manager may be installed while paused even if Windows Time is not
+yet healthy. This does not create a consume task. Enabling automation, creating
+a controller-owned child job, or explicitly requesting time configuration still
+requires the strict synchronized-clock check.
 
 When the global Codex CLI changes, `ManagerSync` automatically revalidates it read-only: version, platform trust, required app-server contracts, account, and full reset list. Windows verifies Authenticode; Linux verifies npm registry signatures, GitHub provenance, and the native executable hash. Only validated CLI updates are approved for future reservations.
 
