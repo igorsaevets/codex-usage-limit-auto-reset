@@ -3204,7 +3204,11 @@ def run_ui(controller: Controller) -> int:
                 events.put((kind, result))
             except Exception as error:
                 code = error.code if isinstance(error, ManagerError) else "UNEXPECTED_ERROR"
-                events.put(("error", code))
+                try:
+                    observed = controller.observe_status()
+                except Exception:
+                    observed = None
+                events.put(("error", (code, observed)))
 
         def start(kind: str) -> None:
             if busy.get() or closing["requested"]:
@@ -3271,11 +3275,14 @@ def run_ui(controller: Controller) -> int:
                 for button in (toggle, refresh, doctor_button):
                     button.state(["!disabled"])
             if kind == "error":
+                code, observed = value if isinstance(value, tuple) else (value, None)
+                if observed is not None and not closing["requested"]:
+                    present(observed)
                 if not closing["requested"]:
                     messagebox.showerror(
                         "Needs Attention",
                         ERROR_MESSAGES.get(
-                            str(value),
+                            str(code),
                             "A problem occurred while running the safety checks.",
                         ),
                     )
@@ -3315,7 +3322,7 @@ def run_ui(controller: Controller) -> int:
                 if action == "open":
                     restore_window()
                 elif action == "check":
-                    start("sync")
+                    start("check")
                 elif action == "toggle":
                     start("pause" if latest.get("enabled") else "enable")
                 elif action == "exit":
@@ -3332,7 +3339,7 @@ def run_ui(controller: Controller) -> int:
         toggle.configure(
             command=lambda: start("pause" if latest.get("enabled") else "enable")
         )
-        refresh.configure(command=lambda: start("sync"))
+        refresh.configure(command=lambda: start("check"))
         doctor_button.configure(command=lambda: start("doctor"))
         open_log_button.configure(command=open_log)
         tray = NativeTrayIcon(
