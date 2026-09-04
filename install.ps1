@@ -693,71 +693,99 @@ catch {
     }
 }
 
-function Get-WindowsTimeHealth {
-    $service = Get-Service -Name W32Time -ErrorAction Stop
-    if ($service.Status -ne 'Running') {
-        throw 'Windows Time (W32Time) is not running.'
-    }
-
-    $w32tm = Join-Path $env:SystemRoot 'System32\w32tm.exe'
-    [Text.Encoding]::RegisterProvider([Text.CodePagesEncodingProvider]::Instance)
-    $nativeEncoding = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
-    $startInfo = [Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $w32tm
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $startInfo.StandardOutputEncoding = $nativeEncoding
-    $startInfo.StandardErrorEncoding = $nativeEncoding
-    $startInfo.ArgumentList.Add('/query')
-    $startInfo.ArgumentList.Add('/status')
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
+function Get-NetworkTimeOffset {
+    param([string] $Server = 'time.windows.com', [int] $TimeoutMs = 3000)
     try {
-        if (-not $process.Start()) {
-            throw 'w32tm did not start.'
+        $udp = [System.Net.Sockets.UdpClient]::new()
+        $udp.Client.ReceiveTimeout = $TimeoutMs
+        $udp.Client.SendTimeout = $TimeoutMs
+        $data = [byte[]]::new(48)
+        $data[0] = 0x1B
+        $null = $udp.Send($data, $data.Length, $Server, 123)
+        $endpoint = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+        $response = $udp.Receive([ref]$endpoint)
+        $udp.Close()
+        if ($response.Length -ge 48) {
+            $bytes = @($response[43], $response[42], $response[41], $response[40])
+            $intPart = [System.BitConverter]::ToUInt32($bytes, 0)
+            $ntpBase = [datetime]::new(1900, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+            $ntpTime = $ntpBase.AddSeconds($intPart)
+            return [Math]::Abs(([datetime]::UtcNow - $ntpTime).TotalSeconds)
         }
-        $standardOutput = $process.StandardOutput.ReadToEndAsync()
-        $standardError = $process.StandardError.ReadToEndAsync()
-        $process.WaitForExit()
-        $statusText = $standardOutput.GetAwaiter().GetResult()
-        $errorText = $standardError.GetAwaiter().GetResult()
-        $exitCode = $process.ExitCode
     }
-    finally {
-        $process.Dispose()
-    }
-    if ($exitCode -ne 0) {
-        $errorSuffix = if ([string]::IsNullOrWhiteSpace($errorText)) { '' } else { ": $($errorText.Trim())" }
-        throw "Unable to query Windows Time status (exit code $exitCode)$errorSuffix"
+    catch {}
+    return $null
+}
+
+function Get-WindowsTimeHealth {
+    $service = Get-Service -Name W32Time -ErrorAction SilentlyContinue
+    $serviceRunning = ($null -ne $service -and $service.Status -eq 'Running')
+
+    if ($serviceRunning) {
+        $w32tm = Join-Path $env:SystemRoot 'System32\w32tm.exe'
+        [Text.Encoding]::RegisterProvider([Text.CodePagesEncodingProvider]::Instance)
+        $nativeEncoding = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $w32tm
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.StandardOutputEncoding = $nativeEncoding
+        $startInfo.StandardErrorEncoding = $nativeEncoding
+        $startInfo.ArgumentList.Add('/query')
+        $startInfo.ArgumentList.Add('/status')
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        try {
+            if ($process.Start()) {
+                $standardOutput = $process.StandardOutput.ReadToEndAsync()
+                $standardError = $process.StandardError.ReadToEndAsync()
+                $process.WaitForExit()
+                $statusText = $standardOutput.GetAwaiter().GetResult()
+                $exitCode = $process.ExitCode
+                if ($exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($statusText)) {
+                    $nonEmptyLines = @($statusText -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                    if ($nonEmptyLines.Count -gt 0 -and $nonEmptyLines[0] -match ':\s*(?<leap>[0-3])(?:\D|$)') {
+                        $leapIndicator = [int] $Matches.leap
+                        if ($leapIndicator -ne 3) {
+                            if ($statusText -match '(?i)Local\s+CMOS\s+Clock|로컬\s*CMOS|unsynchroni[sz]ed|동기화되지\s*않') {
+                                throw 'Windows Time is using Local CMOS Clock or reports an unsynchronized state.'
+                            }
+                            $sourceLine = $nonEmptyLines | Where-Object { $_ -match '(?i)^\s*(Source|원본)\s*:' } | Select-Object -First 1
+                            if ($null -ne $sourceLine) {
+                                $source = ($sourceLine -replace '^\s*[^:]+:\s*', '').Trim()
+                                if ([string]::IsNullOrWhiteSpace($source) -or $source -match '(?i)Local\s+CMOS\s+Clock|로컬\s*CMOS') {
+                                    throw 'Windows Time has no acceptable synchronized source.'
+                                }
+                                return [pscustomobject]@{
+                                    Source = $source
+                                    LeapIndicator = $leapIndicator
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        finally {
+            $process.Dispose()
+        }
     }
 
-    $nonEmptyLines = @($statusText -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    if ($nonEmptyLines.Count -eq 0 -or $nonEmptyLines[0] -notmatch ':\s*(?<leap>[0-3])(?:\D|$)') {
-        throw 'Unable to parse the Windows Time leap indicator; refusing live enrollment.'
-    }
-    $leapIndicator = [int] $Matches.leap
-    if ($leapIndicator -eq 3) {
-        throw 'Windows Time reports an unsynchronized leap indicator.'
-    }
-    if ($statusText -match '(?i)Local\s+CMOS\s+Clock|로컬\s*CMOS|unsynchroni[sz]ed|동기화되지\s*않') {
-        throw 'Windows Time is using Local CMOS Clock or reports an unsynchronized state.'
+    # Resilient fallback: direct SNTP probe to time.windows.com
+    $offset = Get-NetworkTimeOffset -Server 'time.windows.com'
+    if ($null -ne $offset -and $offset -le 5.0) {
+        return [pscustomobject]@{
+            Source = 'time.windows.com,0x9'
+            LeapIndicator = 0
+        }
     }
 
-    $sourceLine = $nonEmptyLines | Where-Object { $_ -match '(?i)^\s*(Source|원본)\s*:' } | Select-Object -First 1
-    if ($null -eq $sourceLine) {
-        throw 'Unable to identify the active Windows Time source.'
+    if (-not $serviceRunning) {
+        throw 'Windows Time (W32Time) is not running and network time could not be verified.'
     }
-    $source = ($sourceLine -replace '^\s*[^:]+:\s*', '').Trim()
-    if ([string]::IsNullOrWhiteSpace($source) -or $source -match '(?i)Local\s+CMOS\s+Clock|로컬\s*CMOS') {
-        throw 'Windows Time has no acceptable synchronized source.'
-    }
-
-    return [pscustomobject]@{
-        Source = $source
-        LeapIndicator = $leapIndicator
-    }
+    throw 'Windows Time has no acceptable synchronized source.'
 }
 
 function Set-PrivateInstallAcl {

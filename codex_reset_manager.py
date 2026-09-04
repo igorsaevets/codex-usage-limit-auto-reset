@@ -33,7 +33,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
 UTC = timezone.utc
-APP_VERSION = "2.7.1"
+APP_VERSION = "2.7.2"
 POLICY_SCHEMA_VERSION = 1
 MINIMUM_SCHEDULE_MARGIN_SECONDS = 600
 TASK_START_LEAD_SECONDS = 17 * 60
@@ -3167,21 +3167,82 @@ def run_ui(controller: Controller) -> int:
             ("Last result", "result"),
             ("Next reservation", "reservation"),
         )
+        class _ToolTip:
+            def __init__(self, widget: Any, text: str):
+                self.widget = widget
+                self.text = text
+                self.tip_window: Any = None
+                if hasattr(widget, "bind"):
+                    with contextlib.suppress(Exception):
+                        widget.bind("<Enter>", self.show_tip)
+                        widget.bind("<Leave>", self.hide_tip)
+
+            def show_tip(self, event: Any = None) -> None:
+                if self.tip_window or not self.text:
+                    return
+                try:
+                    x = self.widget.winfo_rootx() + 20
+                    y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5
+                    self.tip_window = tw = tk.Toplevel(self.widget)
+                    tw.wm_overrideredirect(True)
+                    tw.wm_geometry(f"+{x}+{y}")
+                    label = tk.Label(
+                        tw,
+                        text=self.text,
+                        justify="left",
+                        background="#1e1e1e",
+                        foreground="#f0f0f0",
+                        relief="solid",
+                        borderwidth=1,
+                        font=("Segoe UI", 9),
+                        padx=8,
+                        pady=6,
+                        wraplength=380,
+                    )
+                    label.pack(ipadx=1)
+                except Exception:
+                    pass
+
+            def hide_tip(self, event: Any = None) -> None:
+                if self.tip_window:
+                    with contextlib.suppress(Exception):
+                        self.tip_window.destroy()
+                    self.tip_window = None
+
+            def update_text(self, text: str) -> None:
+                self.text = text
+
+        tooltips_map = {
+            "Automatic use": "Автоматическое применение: ставит задачу в планировщик Windows ровно за 5 минут до истечения бесплатного сброса. Прямо сейчас сброс НЕ расходуется.",
+            "Current usage": "Текущее использование 5-часового лимита запросов Codex.",
+            "Automatic limit reset": "Время следующего регулярного сброса 5-часового лимита от OpenAI.",
+            "Weekly usage": "Использование недельного лимита запросов Codex.",
+            "Weekly limit reset": "Время следующего регулярного сброса недельного лимита от OpenAI.",
+            "Free reset expires": "Срок действия бесплатных сбросов лимита от OpenAI. За 5 минут до этой даты автоматический режим активирует сброс.",
+            "Scheduled use": "Точное время, на которое запланирован автоматический сброс перед сгоранием.",
+            "Codex CLI": "Совместимость установленной версии Codex CLI.",
+            _system_time_label(): "Синхронизация системных часов Windows с мировым точным временем.",
+            "Next reservation": "Статус задачи в планировщике Windows (ожидание или подготовка).",
+        }
+
         grid = ttk.Frame(frame, style="Manager.TFrame")
         grid.pack(fill="x")
         value_labels: dict[str, Any] = {}
         for row, (caption, name) in enumerate(labels):
-            ttk.Label(
+            caption_widget = ttk.Label(
                 grid,
                 text=caption,
                 style="Manager.Caption.TLabel",
-            ).grid(
+            )
+            caption_widget.grid(
                 row=row,
                 column=0,
                 sticky="w",
                 pady=3,
                 padx=(0, 28),
             )
+            if caption in tooltips_map:
+                _ToolTip(caption_widget, tooltips_map[caption])
             value_label = ttk.Label(
                 grid,
                 textvariable=variables[name],
@@ -3197,12 +3258,24 @@ def run_ui(controller: Controller) -> int:
         grid.columnconfigure(0, minsize=172)
         grid.columnconfigure(1, weight=1)
 
+        hint_banner = ttk.Label(
+            frame,
+            text="💡 Автоматический режим сработает ТОЛЬКО за 5 минут до сгорания бесплатного сброса.\nКнопка 'Start Automatic Use' НЕ расходует ваш сброс прямо сейчас!",
+            style="Manager.Footer.TLabel",
+            wraplength=540,
+        )
+        hint_banner.pack(anchor="w", pady=(8, 0))
+
         buttons = ttk.Frame(frame, style="Manager.TFrame")
-        buttons.pack(fill="x", pady=(20, 0))
+        buttons.pack(fill="x", pady=(14, 0))
         toggle = ttk.Button(
             buttons,
             text="Start Automatic Use",
             style="Manager.TButton",
+        )
+        toggle_tooltip = _ToolTip(
+            toggle,
+            "Включить автосброс перед сгоранием. Лимит НЕ расходуется сейчас, а планируется за 5 минут до даты истечения бесплатного сброса."
         )
         refresh = ttk.Button(buttons, text="Check Now", style="Manager.TButton")
         doctor_button = ttk.Button(
@@ -3336,6 +3409,10 @@ def run_ui(controller: Controller) -> int:
             toggle.configure(
                 text="Pause Automatic Use" if status.get("enabled") else "Start Automatic Use"
             )
+            if status.get("enabled"):
+                toggle_tooltip.update_text("Приостановить автосброс. Запланированная задача снимется, бесплатные сбросы останутся нетронутыми.")
+            else:
+                toggle_tooltip.update_text("Включить автосброс перед сгоранием. Лимит НЕ расходуется сейчас, а планируется за 5 минут до даты истечения бесплатного сброса.")
 
         def worker(kind: str) -> None:
             try:
