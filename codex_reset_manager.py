@@ -33,7 +33,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
 UTC = timezone.utc
-APP_VERSION = "2.6.1"
+APP_VERSION = "2.7.0"
 POLICY_SCHEMA_VERSION = 1
 MINIMUM_SCHEDULE_MARGIN_SECONDS = 600
 TASK_START_LEAD_SECONDS = 17 * 60
@@ -2618,6 +2618,15 @@ class Controller:
             automatic_limit_reset_at_utc=self._automatic_limit_reset_at_utc(snapshot),
             primary_used_percent=snapshot.get("primaryUsedPercent"),
             primary_window_duration_mins=snapshot.get("primaryWindowDurationMins"),
+            secondary_used_percent=snapshot.get("secondaryUsedPercent"),
+            secondary_window_duration_mins=snapshot.get("secondaryWindowDurationMins"),
+            secondary_reset_at_utc=snapshot.get("secondaryResetAtUtc"),
+            five_hour_used_percent=snapshot.get("fiveHourUsedPercent"),
+            five_hour_window_duration_mins=snapshot.get("fiveHourWindowDurationMins"),
+            five_hour_reset_at_utc=snapshot.get("fiveHourResetAtUtc"),
+            weekly_used_percent=snapshot.get("weeklyUsedPercent"),
+            weekly_window_duration_mins=snapshot.get("weeklyWindowDurationMins"),
+            weekly_reset_at_utc=snapshot.get("weeklyResetAtUtc"),
             plan_type=snapshot.get("planType"),
         )
         self._save_policy(policy)
@@ -2783,6 +2792,15 @@ class Controller:
         cli_status_override: str | None = None,
         primary_used_percent: float | None = None,
         primary_window_duration_mins: int | None = None,
+        secondary_used_percent: float | None = None,
+        secondary_window_duration_mins: int | None = None,
+        secondary_reset_at_utc: str | None = None,
+        five_hour_used_percent: float | None = None,
+        five_hour_window_duration_mins: int | None = None,
+        five_hour_reset_at_utc: str | None = None,
+        weekly_used_percent: float | None = None,
+        weekly_window_duration_mins: int | None = None,
+        weekly_reset_at_utc: str | None = None,
         plan_type: str | None = None,
     ) -> dict[str, Any]:
         blocked = policy.get("blocked")
@@ -2817,6 +2835,15 @@ class Controller:
             "automaticLimitResetAtUtc": automatic_limit_reset_at_utc,
             "primaryUsedPercent": primary_used_percent,
             "primaryWindowDurationMins": primary_window_duration_mins,
+            "secondaryUsedPercent": secondary_used_percent,
+            "secondaryWindowDurationMins": secondary_window_duration_mins,
+            "secondaryResetAtUtc": secondary_reset_at_utc,
+            "fiveHourUsedPercent": five_hour_used_percent,
+            "fiveHourWindowDurationMins": five_hour_window_duration_mins,
+            "fiveHourResetAtUtc": five_hour_reset_at_utc,
+            "weeklyUsedPercent": weekly_used_percent,
+            "weeklyWindowDurationMins": weekly_window_duration_mins,
+            "weeklyResetAtUtc": weekly_reset_at_utc,
             "planType": plan_type,
             "cliStatus": cli_status,
             "timeStatus": time_state,
@@ -2918,18 +2945,49 @@ def _human_status(status: Mapping[str, Any]) -> str:
         status.get("automation"), "Needs attention"
     )
     lines = [f"Automatic use: {automation}"]
-    used_pct = status.get("primaryUsedPercent")
-    if isinstance(used_pct, (int, float)):
-        used_val = float(used_pct)
-        rem_val = max(0.0, 100.0 - used_val)
-        dur = status.get("primaryWindowDurationMins")
-        dur_str = f" ({dur // 1440}d window)" if dur and dur >= 1440 else (f" ({dur // 60}h window)" if dur else "")
-        lines.append(f"Current usage: {used_val:.1f}% used ({rem_val:.1f}% left){dur_str}")
-    automatic_limit = status.get("automaticLimitResetAtUtc")
-    if automatic_limit is not None or "automaticLimitResetAtUtc" in status:
-        lines.append(
-            f"Automatic limit reset: {_status_deadline_text(automatic_limit if isinstance(automatic_limit, str) else None, empty='Not available')}"
-        )
+    h5_pct = status.get("fiveHourUsedPercent")
+    if h5_pct is None and (status.get("primaryWindowDurationMins") or 0) <= 720:
+        h5_pct = status.get("primaryUsedPercent")
+    if isinstance(h5_pct, (int, float)):
+        used_v = float(h5_pct)
+        rem_v = max(0.0, 100.0 - used_v)
+        lines.append(f"5-hour usage: {used_v:.1f}% used ({rem_v:.1f}% left)")
+        h5_reset = status.get("fiveHourResetAtUtc")
+        if not h5_reset and (status.get("primaryWindowDurationMins") or 0) <= 720:
+            h5_reset = status.get("automaticLimitResetAtUtc")
+        if h5_reset:
+            lines.append(f"5-hour limit reset: {_status_deadline_text(h5_reset, empty='Not available')}")
+
+    wk_pct = status.get("weeklyUsedPercent")
+    if wk_pct is None and (status.get("primaryWindowDurationMins") or 0) > 720:
+        wk_pct = status.get("primaryUsedPercent")
+    elif wk_pct is None and (status.get("secondaryWindowDurationMins") or 0) > 720:
+        wk_pct = status.get("secondaryUsedPercent")
+    if isinstance(wk_pct, (int, float)):
+        used_w = float(wk_pct)
+        rem_w = max(0.0, 100.0 - used_w)
+        lines.append(f"Weekly usage: {used_w:.1f}% used ({rem_w:.1f}% left)")
+        wk_reset = status.get("weeklyResetAtUtc")
+        if not wk_reset and (status.get("primaryWindowDurationMins") or 0) > 720:
+            wk_reset = status.get("automaticLimitResetAtUtc")
+        elif not wk_reset and (status.get("secondaryWindowDurationMins") or 0) > 720:
+            wk_reset = status.get("secondaryResetAtUtc")
+        if wk_reset:
+            lines.append(f"Weekly limit reset: {_status_deadline_text(wk_reset, empty='Not available')}")
+
+    if not isinstance(h5_pct, (int, float)) and not isinstance(wk_pct, (int, float)):
+        used_pct = status.get("primaryUsedPercent")
+        if isinstance(used_pct, (int, float)):
+            used_val = float(used_pct)
+            rem_val = max(0.0, 100.0 - used_val)
+            dur = status.get("primaryWindowDurationMins")
+            dur_str = f" ({dur // 1440}d window)" if dur and dur >= 1440 else (f" ({dur // 60}h window)" if dur else "")
+            lines.append(f"Current usage: {used_val:.1f}% used ({rem_val:.1f}% left){dur_str}")
+        automatic_limit = status.get("automaticLimitResetAtUtc")
+        if automatic_limit is not None or "automaticLimitResetAtUtc" in status:
+            lines.append(
+                f"Automatic limit reset: {_status_deadline_text(automatic_limit if isinstance(automatic_limit, str) else None, empty='Not available')}"
+            )
     free_reset = status.get("freeResetExpiresAtUtc") or status.get("nextExpiresAtUtc")
     if free_reset is not None or "freeResetExpiresAtUtc" in status or "nextExpiresAtUtc" in status:
         lines.append(
@@ -3082,12 +3140,26 @@ def run_ui(controller: Controller) -> int:
 
         variables = {
             name: tk.StringVar(value="Checking...")
-            for name in ("automation", "usage", "auto_reset", "free_reset", "process", "cli", "clock", "result", "reservation")
+            for name in (
+                "automation",
+                "usage",
+                "auto_reset",
+                "weekly_usage",
+                "weekly_reset",
+                "free_reset",
+                "process",
+                "cli",
+                "clock",
+                "result",
+                "reservation",
+            )
         }
         labels = (
             ("Automatic use", "automation"),
             ("Current usage", "usage"),
             ("Automatic limit reset", "auto_reset"),
+            ("Weekly usage", "weekly_usage"),
+            ("Weekly limit reset", "weekly_reset"),
             ("Free reset expires", "free_reset"),
             ("Scheduled use", "process"),
             ("Codex CLI", "cli"),
@@ -3164,20 +3236,59 @@ def run_ui(controller: Controller) -> int:
                     status.get("automation"), "Needs attention"
                 )
             )
-            used_pct = status.get("primaryUsedPercent")
-            if isinstance(used_pct, (int, float)):
-                used_val = float(used_pct)
-                rem_val = max(0.0, 100.0 - used_val)
-                dur = status.get("primaryWindowDurationMins")
-                dur_str = f" ({dur // 1440}d window)" if dur and dur >= 1440 else (f" ({dur // 60}h window)" if dur else "")
-                variables["usage"].set(f"{used_val:.1f}% used ({rem_val:.1f}% left){dur_str}")
+
+            # Short-term / 5-hour usage & reset (Current usage & Automatic limit reset)
+            h5_pct = status.get("fiveHourUsedPercent")
+            if h5_pct is None and (status.get("primaryWindowDurationMins") or 0) <= 720:
+                h5_pct = status.get("primaryUsedPercent")
+            h5_dur = status.get("fiveHourWindowDurationMins") or status.get("primaryWindowDurationMins")
+            if isinstance(h5_pct, (int, float)):
+                used_v = float(h5_pct)
+                rem_v = max(0.0, 100.0 - used_v)
+                dur_tag = f" ({h5_dur // 60}h window)" if h5_dur else " (5h window)"
+                variables["usage"].set(f"{used_v:.1f}% used ({rem_v:.1f}% left){dur_tag}")
             else:
-                variables["usage"].set("Not available")
+                used_pct = status.get("primaryUsedPercent")
+                if isinstance(used_pct, (int, float)):
+                    used_val = float(used_pct)
+                    rem_val = max(0.0, 100.0 - used_val)
+                    dur = status.get("primaryWindowDurationMins")
+                    dur_str = f" ({dur // 1440}d window)" if dur and dur >= 1440 else (f" ({dur // 60}h window)" if dur else "")
+                    variables["usage"].set(f"{used_val:.1f}% used ({rem_val:.1f}% left){dur_str}")
+                else:
+                    variables["usage"].set("Not active")
+
+            h5_reset = status.get("fiveHourResetAtUtc")
+            if not h5_reset and (status.get("primaryWindowDurationMins") or 0) <= 720:
+                h5_reset = status.get("automaticLimitResetAtUtc")
+            fallback_reset = status.get("automaticLimitResetAtUtc") if isinstance(status.get("automaticLimitResetAtUtc"), str) else None
             variables["auto_reset"].set(
-                _status_deadline_text(
-                    status.get("automaticLimitResetAtUtc") if isinstance(status.get("automaticLimitResetAtUtc"), str) else None,
-                    empty="Not available",
-                )
+                _status_deadline_text(h5_reset if isinstance(h5_reset, str) else fallback_reset, empty="Not available")
+            )
+
+            # Weekly usage & reset
+            wk_pct = status.get("weeklyUsedPercent")
+            if wk_pct is None and (status.get("primaryWindowDurationMins") or 0) > 720:
+                wk_pct = status.get("primaryUsedPercent")
+            elif wk_pct is None and (status.get("secondaryWindowDurationMins") or 0) > 720:
+                wk_pct = status.get("secondaryUsedPercent")
+            wk_dur = status.get("weeklyWindowDurationMins")
+            if isinstance(wk_pct, (int, float)):
+                used_w = float(wk_pct)
+                rem_w = max(0.0, 100.0 - used_w)
+                dur_w_tag = f" ({wk_dur // 1440}d window)" if wk_dur and wk_dur >= 1440 else " (7d window)"
+                variables["weekly_usage"].set(f"{used_w:.1f}% used ({rem_w:.1f}% left){dur_w_tag}")
+            else:
+                variables["weekly_usage"].set("Not active")
+
+            wk_reset = status.get("weeklyResetAtUtc")
+            if not wk_reset and (status.get("primaryWindowDurationMins") or 0) > 720:
+                wk_reset = status.get("automaticLimitResetAtUtc")
+            elif not wk_reset and (status.get("secondaryWindowDurationMins") or 0) > 720:
+                wk_reset = status.get("secondaryResetAtUtc")
+            variables["weekly_reset"].set(
+                _status_deadline_text(wk_reset if isinstance(wk_reset, str) else None, empty="Not available")
+                if wk_reset else "Not active"
             )
             free_reset_utc = status.get("freeResetExpiresAtUtc") or status.get("nextExpiresAtUtc")
             variables["free_reset"].set(

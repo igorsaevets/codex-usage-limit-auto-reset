@@ -2210,6 +2210,86 @@ def _safe_primary_window_mins(response: Mapping[str, Any]) -> int | None:
     return None
 
 
+def _safe_secondary_reset_epoch(response: Mapping[str, Any]) -> int | None:
+    rate_limits = response.get("rateLimits")
+    if not isinstance(rate_limits, Mapping):
+        return None
+    secondary = rate_limits.get("secondary")
+    if not isinstance(secondary, Mapping):
+        return None
+    resets_at = secondary.get("resetsAt")
+    if not _is_int(resets_at) or resets_at <= 0:
+        return None
+    return int(resets_at)
+
+
+def _safe_secondary_used_percent(response: Mapping[str, Any]) -> float | None:
+    rate_limits = response.get("rateLimits")
+    if not isinstance(rate_limits, Mapping):
+        return None
+    secondary = rate_limits.get("secondary")
+    if not isinstance(secondary, Mapping):
+        return None
+    used = secondary.get("usedPercent")
+    if isinstance(used, (int, float)) and not isinstance(used, bool):
+        return float(used)
+    return None
+
+
+def _safe_secondary_window_mins(response: Mapping[str, Any]) -> int | None:
+    rate_limits = response.get("rateLimits")
+    if not isinstance(rate_limits, Mapping):
+        return None
+    secondary = rate_limits.get("secondary")
+    if not isinstance(secondary, Mapping):
+        return None
+    mins = secondary.get("windowDurationMins")
+    if _is_int(mins) and mins > 0:
+        return int(mins)
+    return None
+
+
+def _classify_rate_limit_windows(
+    primary_used: float | None,
+    primary_mins: int | None,
+    primary_reset: int | None,
+    secondary_used: float | None,
+    secondary_mins: int | None,
+    secondary_reset: int | None,
+) -> dict[str, Any]:
+    five_hour: dict[str, Any] = {"usedPercent": None, "windowDurationMins": None, "resetsAt": None}
+    weekly: dict[str, Any] = {"usedPercent": None, "windowDurationMins": None, "resetsAt": None}
+
+    candidates = []
+    if primary_mins is not None or primary_used is not None:
+        candidates.append((primary_mins, primary_used, primary_reset))
+    if secondary_mins is not None or secondary_used is not None:
+        candidates.append((secondary_mins, secondary_used, secondary_reset))
+
+    for mins, used, reset in candidates:
+        if mins is not None:
+            if mins <= 720:
+                if five_hour["windowDurationMins"] is None or mins == 300:
+                    five_hour = {"usedPercent": used, "windowDurationMins": mins, "resetsAt": reset}
+            else:
+                if weekly["windowDurationMins"] is None or mins == 10080:
+                    weekly = {"usedPercent": used, "windowDurationMins": mins, "resetsAt": reset}
+        else:
+            if five_hour["usedPercent"] is None:
+                five_hour = {"usedPercent": used, "windowDurationMins": mins, "resetsAt": reset}
+            elif weekly["usedPercent"] is None:
+                weekly = {"usedPercent": used, "windowDurationMins": mins, "resetsAt": reset}
+
+    return {
+        "fiveHourUsedPercent": five_hour["usedPercent"],
+        "fiveHourWindowDurationMins": five_hour["windowDurationMins"],
+        "fiveHourResetAt": five_hour["resetsAt"],
+        "weeklyUsedPercent": weekly["usedPercent"],
+        "weeklyWindowDurationMins": weekly["windowDurationMins"],
+        "weeklyResetAt": weekly["resetsAt"],
+    }
+
+
 def _safe_plan_type(response: Mapping[str, Any]) -> str | None:
     rate_limits = response.get("rateLimits")
     if isinstance(rate_limits, Mapping):
@@ -2273,6 +2353,17 @@ def validate_cli_compatibility(
         automatic_limit_reset_at = _safe_primary_reset_epoch(rates)
         primary_used_percent = _safe_primary_used_percent(rates)
         primary_window_mins = _safe_primary_window_mins(rates)
+        secondary_used_percent = _safe_secondary_used_percent(rates)
+        secondary_window_mins = _safe_secondary_window_mins(rates)
+        secondary_reset_at = _safe_secondary_reset_epoch(rates)
+        classified = _classify_rate_limit_windows(
+            primary_used_percent,
+            primary_window_mins,
+            automatic_limit_reset_at,
+            secondary_used_percent,
+            secondary_window_mins,
+            secondary_reset_at,
+        )
         plan_type = _safe_plan_type(rates)
     if _is_linux():
         after_observed = observe_cli_pin(str(exe))
@@ -2315,6 +2406,30 @@ def validate_cli_compatibility(
         ),
         "primaryUsedPercent": primary_used_percent,
         "primaryWindowDurationMins": primary_window_mins,
+        "secondaryUsedPercent": secondary_used_percent,
+        "secondaryWindowDurationMins": secondary_window_mins,
+        "secondaryResetAt": secondary_reset_at,
+        "secondaryResetAtUtc": (
+            _iso_utc(secondary_reset_at)
+            if secondary_reset_at is not None
+            else None
+        ),
+        "fiveHourUsedPercent": classified["fiveHourUsedPercent"],
+        "fiveHourWindowDurationMins": classified["fiveHourWindowDurationMins"],
+        "fiveHourResetAt": classified["fiveHourResetAt"],
+        "fiveHourResetAtUtc": (
+            _iso_utc(classified["fiveHourResetAt"])
+            if classified["fiveHourResetAt"] is not None
+            else None
+        ),
+        "weeklyUsedPercent": classified["weeklyUsedPercent"],
+        "weeklyWindowDurationMins": classified["weeklyWindowDurationMins"],
+        "weeklyResetAt": classified["weeklyResetAt"],
+        "weeklyResetAtUtc": (
+            _iso_utc(classified["weeklyResetAt"])
+            if classified["weeklyResetAt"] is not None
+            else None
+        ),
         "planType": plan_type,
     }
 
