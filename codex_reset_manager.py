@@ -33,7 +33,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
 UTC = timezone.utc
-APP_VERSION = "2.7.2"
+APP_VERSION = "2.7.3"
 POLICY_SCHEMA_VERSION = 1
 MINIMUM_SCHEDULE_MARGIN_SECONDS = 600
 TASK_START_LEAD_SECONDS = 17 * 60
@@ -3066,8 +3066,8 @@ def run_ui(controller: Controller) -> int:
     try:
         root = tk.Tk()
         root.title(f"Codex Usage Limit Reset Manager v{APP_VERSION}")
-        root.geometry("640x490")
-        root.minsize(600, 450)
+        root.geometry("660x590")
+        root.minsize(620, 500)
         root.configure(background="#FFFFFF")
         root.option_add("*Font", ("Segoe UI", 10))
 
@@ -3122,7 +3122,7 @@ def run_ui(controller: Controller) -> int:
         )
         style.configure("Manager.TButton", font=("Segoe UI", 10), padding=(12, 7))
 
-        frame = ttk.Frame(root, padding=(32, 24, 32, 18), style="Manager.TFrame")
+        frame = ttk.Frame(root, padding=(28, 16, 28, 14), style="Manager.TFrame")
         frame.pack(fill="both", expand=True)
         title = ttk.Label(
             frame,
@@ -3134,9 +3134,9 @@ def run_ui(controller: Controller) -> int:
             frame,
             text=f"Version {APP_VERSION} · Safely uses one selected usage limit reset about five minutes before it expires.",
             style="Manager.Subtitle.TLabel",
-            wraplength=520,
+            wraplength=560,
         )
-        subtitle.pack(anchor="w", pady=(4, 14))
+        subtitle.pack(anchor="w", pady=(2, 10))
 
         variables = {
             name: tk.StringVar(value="Checking...")
@@ -3238,8 +3238,8 @@ def run_ui(controller: Controller) -> int:
                 row=row,
                 column=0,
                 sticky="w",
-                pady=3,
-                padx=(0, 28),
+                pady=2,
+                padx=(0, 24),
             )
             if caption in tooltips_map:
                 _ToolTip(caption_widget, tooltips_map[caption])
@@ -3252,22 +3252,22 @@ def run_ui(controller: Controller) -> int:
                 row=row,
                 column=1,
                 sticky="w",
-                pady=3,
+                pady=2,
             )
             value_labels[name] = value_label
-        grid.columnconfigure(0, minsize=172)
+        grid.columnconfigure(0, minsize=168)
         grid.columnconfigure(1, weight=1)
 
         hint_banner = ttk.Label(
             frame,
             text="💡 Автоматический режим сработает ТОЛЬКО за 5 минут до сгорания бесплатного сброса.\nКнопка 'Start Automatic Use' НЕ расходует ваш сброс прямо сейчас!",
             style="Manager.Footer.TLabel",
-            wraplength=540,
+            wraplength=560,
         )
         hint_banner.pack(anchor="w", pady=(8, 0))
 
         buttons = ttk.Frame(frame, style="Manager.TFrame")
-        buttons.pack(fill="x", pady=(14, 0))
+        buttons.pack(fill="x", pady=(12, 0))
         toggle = ttk.Button(
             buttons,
             text="Start Automatic Use",
@@ -3294,7 +3294,7 @@ def run_ui(controller: Controller) -> int:
             text="Automation continues when this window is hidden or exited.",
             style="Manager.Footer.TLabel",
         )
-        footer.pack(anchor="w", pady=(14, 0))
+        footer.pack(anchor="w", pady=(10, 0))
         busy = tk.BooleanVar(value=False)
         events: queue.Queue[tuple[str, Any]] = queue.Queue()
         tray_events: queue.Queue[str] = queue.Queue()

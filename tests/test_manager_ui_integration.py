@@ -317,8 +317,8 @@ class ManagerUiIntegrationTests(unittest.TestCase):
         root, _, _ = self._run(tray_starts=False)
 
         self.assertEqual(root.title_value, f"Codex Usage Limit Reset Manager v{manager.APP_VERSION}")
-        self.assertEqual(root.geometry_value, "640x490")
-        self.assertEqual(root.minsize_value, (600, 450))
+        self.assertEqual(root.geometry_value, "660x590")
+        self.assertEqual(root.minsize_value, (620, 500))
         self.assertEqual(root.options["background"], "#FFFFFF")
         assert _Style.instance is not None
         styles = _Style.instance.configurations
