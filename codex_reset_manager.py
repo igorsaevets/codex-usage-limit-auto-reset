@@ -33,7 +33,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
 UTC = timezone.utc
-APP_VERSION = "2.7.3"
+APP_VERSION = "2.7.4"
 POLICY_SCHEMA_VERSION = 1
 MINIMUM_SCHEDULE_MARGIN_SECONDS = 600
 TASK_START_LEAD_SECONDS = 17 * 60
@@ -2443,21 +2443,20 @@ class Controller:
             if preserve_on_global_cli_failure and error.code != "ACCOUNT_CHANGED":
                 raise PreserveActiveJobError(error.code) from error
             raise
-        del snapshot
         policy["lastSyncAtUtc"] = _utc_text(self.now())
         self._clear_block(policy)
         if self._quarantine_barrier(policy, credits):
             self._save_policy(policy)
-            return self._status_from(policy, current, time_state="synchronized", reservation="waiting")
+            return self._status_from_snapshot(policy, current, snapshot, credits, time_state="synchronized", reservation="waiting")
 
         if current is not None and current.terminal:
             if not self._terminal_reconciled(policy, current, credits):
                 self._save_policy(policy)
-                return self._status_from(policy, current, time_state="synchronized", reservation="waiting")
+                return self._status_from_snapshot(policy, current, snapshot, credits, time_state="synchronized", reservation="waiting")
             # Quarantine may have been added while reconciling.
             if self._quarantine_barrier(policy, credits):
                 self._save_policy(policy)
-                return self._status_from(policy, current, time_state="synchronized", reservation="waiting")
+                return self._status_from_snapshot(policy, current, snapshot, credits, time_state="synchronized", reservation="waiting")
             policy["currentJob"] = None
             current = None
 
@@ -2480,9 +2479,11 @@ class Controller:
                 }
                 policy["currentJob"] = None
                 self._save_policy(policy)
-                return self._status_from(
+                return self._status_from_snapshot(
                     policy,
                     None,
+                    snapshot,
+                    credits,
                     time_state="synchronized",
                     reservation="waiting",
                 )
@@ -2502,9 +2503,11 @@ class Controller:
                 policy["currentJob"] = None
                 if self.now() < current.expires_at:
                     self._save_policy(policy)
-                    return self._status_from(
+                    return self._status_from_snapshot(
                         policy,
                         None,
+                        snapshot,
+                        credits,
                         time_state="synchronized",
                         reservation="waiting",
                     )
@@ -2522,14 +2525,14 @@ class Controller:
                 if not self._has_margin(earliest):
                     self._quarantine_credit(policy, earliest, "EARLIER_CREDIT_TOO_LATE")
                     self._save_policy(policy)
-                    return self._status_from(policy, None, time_state="synchronized", reservation="waiting")
+                    return self._status_from_snapshot(policy, None, snapshot, credits, time_state="synchronized", reservation="waiting")
             elif not self.services.binary_pin_available(current):
                 self.services.disarm(current)
                 policy["currentJob"] = None
                 if not self._has_margin(current):
                     self._quarantine_credit(policy, current, "CLI_CHANGED_TOO_LATE")
                     self._save_policy(policy)
-                    return self._status_from(policy, None, time_state="synchronized", reservation="waiting")
+                    return self._status_from_snapshot(policy, None, snapshot, credits, time_state="synchronized", reservation="waiting")
                 current = None
             else:
                 # The exact task contract was validated before the mutable
@@ -2539,19 +2542,21 @@ class Controller:
         if current is None:
             if not credits:
                 self._save_policy(policy)
-                return self._status_from(policy, None, time_state="synchronized", reservation="none")
+                return self._status_from_snapshot(policy, None, snapshot, credits, time_state="synchronized", reservation="none")
             if not self._has_margin(credits[0]):
                 self._quarantine_credit(policy, credits[0], "INSUFFICIENT_LEAD_TIME")
                 self._save_policy(policy)
-                return self._status_from(
+                return self._status_from_snapshot(
                     policy,
                     None,
+                    snapshot,
+                    credits,
                     time_state="synchronized",
                     reservation="waiting",
                 )
             current = self._create_child(policy, credits)
         self._save_policy(policy)
-        return self._status_from(policy, current, time_state="synchronized")
+        return self._status_from_snapshot(policy, current, snapshot, credits, time_state="synchronized")
 
     def _mutating_operation(self, operation: Callable[[dict[str, Any], list[Job]], dict[str, Any]]) -> dict[str, Any]:
         with self._controller_lock():
@@ -2610,24 +2615,12 @@ class Controller:
             time_state = "attention"
         snapshot, credits = self._validate_runtime(policy)
         policy["lastSyncAtUtc"] = _utc_text(self.now())
-        status = self._status_from(
+        status = self._status_from_snapshot(
             policy,
             current,
+            snapshot,
+            credits,
             time_state=time_state,
-            free_reset_expires_at_utc=(_utc_text(credits[0].expires_at) if credits else None),
-            automatic_limit_reset_at_utc=self._automatic_limit_reset_at_utc(snapshot),
-            primary_used_percent=snapshot.get("primaryUsedPercent"),
-            primary_window_duration_mins=snapshot.get("primaryWindowDurationMins"),
-            secondary_used_percent=snapshot.get("secondaryUsedPercent"),
-            secondary_window_duration_mins=snapshot.get("secondaryWindowDurationMins"),
-            secondary_reset_at_utc=snapshot.get("secondaryResetAtUtc"),
-            five_hour_used_percent=snapshot.get("fiveHourUsedPercent"),
-            five_hour_window_duration_mins=snapshot.get("fiveHourWindowDurationMins"),
-            five_hour_reset_at_utc=snapshot.get("fiveHourResetAtUtc"),
-            weekly_used_percent=snapshot.get("weeklyUsedPercent"),
-            weekly_window_duration_mins=snapshot.get("weeklyWindowDurationMins"),
-            weekly_reset_at_utc=snapshot.get("weeklyResetAtUtc"),
-            plan_type=snapshot.get("planType"),
         )
         self._save_policy(policy)
         self._log(
@@ -2851,6 +2844,39 @@ class Controller:
             "reservationStatus": reservation,
             "blockedCode": blocked_code,
         }
+
+    def _status_from_snapshot(
+        self,
+        policy: Mapping[str, Any],
+        current: Job | None,
+        snapshot: Mapping[str, Any],
+        credits: Sequence[Credit],
+        *,
+        time_state: str = "synchronized",
+        reservation: str | None = None,
+        cli_status_override: str | None = None,
+    ) -> dict[str, Any]:
+        return self._status_from(
+            policy,
+            current,
+            time_state=time_state,
+            reservation=reservation,
+            cli_status_override=cli_status_override,
+            free_reset_expires_at_utc=(_utc_text(credits[0].expires_at) if credits else None),
+            automatic_limit_reset_at_utc=self._automatic_limit_reset_at_utc(snapshot),
+            primary_used_percent=snapshot.get("primaryUsedPercent"),
+            primary_window_duration_mins=snapshot.get("primaryWindowDurationMins"),
+            secondary_used_percent=snapshot.get("secondaryUsedPercent"),
+            secondary_window_duration_mins=snapshot.get("secondaryWindowDurationMins"),
+            secondary_reset_at_utc=snapshot.get("secondaryResetAtUtc"),
+            five_hour_used_percent=snapshot.get("fiveHourUsedPercent"),
+            five_hour_window_duration_mins=snapshot.get("fiveHourWindowDurationMins"),
+            five_hour_reset_at_utc=snapshot.get("fiveHourResetAtUtc"),
+            weekly_used_percent=snapshot.get("weeklyUsedPercent"),
+            weekly_window_duration_mins=snapshot.get("weeklyWindowDurationMins"),
+            weekly_reset_at_utc=snapshot.get("weeklyResetAtUtc"),
+            plan_type=snapshot.get("planType"),
+        )
 
 
 def _local_time(epoch: int) -> str:
@@ -3213,16 +3239,16 @@ def run_ui(controller: Controller) -> int:
                 self.text = text
 
         tooltips_map = {
-            "Automatic use": "Автоматическое применение: ставит задачу в планировщик Windows ровно за 5 минут до истечения бесплатного сброса. Прямо сейчас сброс НЕ расходуется.",
-            "Current usage": "Текущее использование 5-часового лимита запросов Codex.",
-            "Automatic limit reset": "Время следующего регулярного сброса 5-часового лимита от OpenAI.",
-            "Weekly usage": "Использование недельного лимита запросов Codex.",
-            "Weekly limit reset": "Время следующего регулярного сброса недельного лимита от OpenAI.",
-            "Free reset expires": "Срок действия бесплатных сбросов лимита от OpenAI. За 5 минут до этой даты автоматический режим активирует сброс.",
-            "Scheduled use": "Точное время, на которое запланирован автоматический сброс перед сгоранием.",
-            "Codex CLI": "Совместимость установленной версии Codex CLI.",
-            _system_time_label(): "Синхронизация системных часов Windows с мировым точным временем.",
-            "Next reservation": "Статус задачи в планировщике Windows (ожидание или подготовка).",
+            "Automatic use": "Automatically schedules and applies your free reset credit 5 minutes before expiration so it never goes to waste. Does not use credits right now.",
+            "Current usage": "Percentage of your short-term (5-hour) Codex request limit currently used.",
+            "Automatic limit reset": "Time when OpenAI automatically replenishes your regular 5-hour limit.",
+            "Weekly usage": "Percentage of your weekly Codex request limit currently used.",
+            "Weekly limit reset": "Time when OpenAI automatically replenishes your weekly limit.",
+            "Free reset expires": "Expiration date of your available OpenAI free reset credits. Automatic mode will trigger a reset 5 minutes before this time.",
+            "Scheduled use": "Exact time when the manager is scheduled to automatically apply your free reset credit.",
+            "Codex CLI": "Integrity and signature verification of the installed Codex CLI binary.",
+            _system_time_label(): "Verification that Windows system clock is synchronized to prevent missed reset windows.",
+            "Next reservation": "Status of the scheduled Windows task that will automatically apply the free reset credit.",
         }
 
         grid = ttk.Frame(frame, style="Manager.TFrame")
@@ -3260,7 +3286,7 @@ def run_ui(controller: Controller) -> int:
 
         hint_banner = ttk.Label(
             frame,
-            text="💡 Автоматический режим сработает ТОЛЬКО за 5 минут до сгорания бесплатного сброса.\nКнопка 'Start Automatic Use' НЕ расходует ваш сброс прямо сейчас!",
+            text="💡 Automatic mode applies your free reset credit ONLY 5 minutes before it expires.\nClicking 'Start Automatic Use' does NOT consume your reset credit right now!",
             style="Manager.Footer.TLabel",
             wraplength=560,
         )
@@ -3275,7 +3301,7 @@ def run_ui(controller: Controller) -> int:
         )
         toggle_tooltip = _ToolTip(
             toggle,
-            "Включить автосброс перед сгоранием. Лимит НЕ расходуется сейчас, а планируется за 5 минут до даты истечения бесплатного сброса."
+            "Schedule automatic use of your free reset credit 5 minutes before expiration to prevent it from expiring unused. Does NOT consume your credit right now."
         )
         refresh = ttk.Button(buttons, text="Check Now", style="Manager.TButton")
         doctor_button = ttk.Button(
@@ -3410,16 +3436,18 @@ def run_ui(controller: Controller) -> int:
                 text="Pause Automatic Use" if status.get("enabled") else "Start Automatic Use"
             )
             if status.get("enabled"):
-                toggle_tooltip.update_text("Приостановить автосброс. Запланированная задача снимется, бесплатные сбросы останутся нетронутыми.")
+                toggle_tooltip.update_text("Pause automatic use. Cancels the scheduled reset task. Your free reset credits remain safe and untouched.")
             else:
-                toggle_tooltip.update_text("Включить автосброс перед сгоранием. Лимит НЕ расходуется сейчас, а планируется за 5 минут до даты истечения бесплатного сброса.")
+                toggle_tooltip.update_text("Schedule automatic use of your free reset credit 5 minutes before expiration to prevent it from expiring unused. Does NOT consume your credit right now.")
 
         def worker(kind: str) -> None:
             try:
                 if kind == "enable":
-                    result = controller.enable()
+                    controller.enable()
+                    result = controller.observe_status()
                 elif kind == "pause":
-                    result = controller.pause()
+                    controller.pause()
+                    result = controller.observe_status()
                 elif kind == "sync":
                     result = controller.sync()
                 elif kind == "doctor":
