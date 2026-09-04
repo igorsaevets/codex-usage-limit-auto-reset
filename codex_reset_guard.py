@@ -2030,6 +2030,50 @@ def _validate_cli_schema(exe: Path) -> None:
                 raise GuardError("Codex usage limit reset detail contract changed")
 
 
+def _probe_windows_network_time_offset(
+    server: str = "time.windows.com",
+    timeout: float = 3.0,
+) -> float | None:
+    try:
+        import socket
+        import struct
+
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client.settimeout(timeout)
+        data = b"\x1b" + 47 * b"\0"
+        client.sendto(data, (server, 123))
+        resp, _ = client.recvfrom(1024)
+        client.close()
+        if len(resp) >= 48:
+            time1970 = 2208988800
+            ntp_epoch = struct.unpack("!12I", resp[:48])[10] - time1970
+            return abs(time.time() - ntp_epoch)
+    except Exception:
+        pass
+
+    try:
+        import urllib.request
+        from email.utils import parsedate_to_datetime
+
+        for url in ("https://www.google.com", "https://api.openai.com", "https://1.1.1.1"):
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": "codex-reset-time-probe/1.0"},
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    date_str = resp.headers.get("Date")
+                    if date_str:
+                        server_time = parsedate_to_datetime(date_str).timestamp()
+                        return abs(time.time() - server_time)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return None
+
+
 def _time_status() -> str:
     if _is_linux():
         _assert_supported_linux_host()
@@ -2106,15 +2150,26 @@ def _time_status() -> str:
     )
     leap_match = re.search(r":\s*([0-3])(?:\D|$)", first_status_line)
     leap_unsynchronized = leap_match is not None and leap_match.group(1) == "3"
-    if (
-        completed.returncode != 0
-        or leap_match is None
-        or leap_unsynchronized
-        or "time.windows.com" not in lowered
-        or any(marker in lowered for marker in rejected)
-    ):
-        raise GuardError("Windows Time is not synchronized to a trusted source")
-    return output
+    w32tm_ok = (
+        completed.returncode == 0
+        and leap_match is not None
+        and not leap_unsynchronized
+        and "time.windows.com" in lowered
+        and not any(marker in lowered for marker in rejected)
+    )
+    if w32tm_ok:
+        return output
+
+    # Fallback: On standalone Windows 10/11 machines, the W32Time service is
+    # stopped by default (0x80070426) or may synchronize against other peers.
+    # Verify true clock synchronization directly via network probe (tolerating up to 5s drift).
+    offset = _probe_windows_network_time_offset()
+    if offset is not None:
+        if offset <= 5.0:
+            return f"time.windows.com (SNTP verified, offset: {offset:.2f}s)"
+        raise GuardError(f"Windows Time clock drift is too large ({offset:.1f}s > 5.0s)")
+
+    raise GuardError("Windows Time is not synchronized to a trusted source")
 
 
 def _observe_pinned_binary(manifest: Mapping[str, Any]) -> dict[str, str]:

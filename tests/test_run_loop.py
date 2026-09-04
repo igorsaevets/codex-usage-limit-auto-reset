@@ -154,7 +154,7 @@ class FakeTransport:
 
 class RunLoopTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.manifest_path = self.root / "config" / "job.json"

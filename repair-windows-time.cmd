@@ -1,0 +1,5 @@
+@echo off
+:: Windows Time Service repair & synchronization script (Elevated)
+echo [Codex Reseter] Запрос прав администратора для запуска службы времени Windows...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -Command Write-Host \"[1/4] Настройка автозапуска W32Time...\" -ForegroundColor Cyan; Set-Service -Name W32Time -StartupType Automatic; Write-Host \"[2/4] Запуск службы W32Time...\" -ForegroundColor Cyan; Start-Service -Name W32Time; Write-Host \"[3/4] Установка сервера time.windows.com...\" -ForegroundColor Cyan; & \"$env:SystemRoot\System32\w32tm.exe\" /config /manualpeerlist:time.windows.com,0x9 /syncfromflags:manual /update; Restart-Service -Name W32Time -Force; Write-Host \"[4/4] Принудительная синхронизация...\" -ForegroundColor Cyan; & \"$env:SystemRoot\System32\w32tm.exe\" /resync /force; Write-Host \"Готово! Служба времени Windows успешно запущена и синхронизирована.\" -ForegroundColor Green; Start-Sleep -Seconds 3'"
+exit /b 0

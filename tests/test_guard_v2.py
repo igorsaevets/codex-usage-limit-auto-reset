@@ -191,6 +191,30 @@ class CompatibilityTests(unittest.TestCase):
         with self.assertRaises(guard.GuardError):
             guard._validate_openai_publisher_subject("CN=Not OpenAI Support LLC")
 
+    def test_time_status_uses_network_probe_fallback_when_w32tm_fails(self) -> None:
+        failed_proc = mock.Mock(returncode=1, stdout="", stderr="Service not running")
+        with (
+            mock.patch.object(guard, "_is_linux", return_value=False),
+            mock.patch.object(guard.os, "name", "nt"),
+            mock.patch.object(guard.subprocess, "run", return_value=failed_proc),
+            mock.patch.object(guard, "_probe_windows_network_time_offset", return_value=0.75),
+        ):
+            res = guard._time_status()
+            self.assertIn("SNTP verified", res)
+            self.assertIn("0.75s", res)
+
+    def test_time_status_rejects_excessive_clock_drift(self) -> None:
+        failed_proc = mock.Mock(returncode=1, stdout="", stderr="Service not running")
+        with (
+            mock.patch.object(guard, "_is_linux", return_value=False),
+            mock.patch.object(guard.os, "name", "nt"),
+            mock.patch.object(guard.subprocess, "run", return_value=failed_proc),
+            mock.patch.object(guard, "_probe_windows_network_time_offset", return_value=12.5),
+        ):
+            with self.assertRaisesRegex(guard.GuardError, "clock drift is too large"):
+                guard._time_status()
+
 
 if __name__ == "__main__":
     unittest.main()
+
