@@ -33,7 +33,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
 UTC = timezone.utc
-APP_VERSION = "2.7.4"
+APP_VERSION = "2.7.5"
 POLICY_SCHEMA_VERSION = 1
 MINIMUM_SCHEDULE_MARGIN_SECONDS = 600
 TASK_START_LEAD_SECONDS = 17 * 60
@@ -249,6 +249,92 @@ class ManagerError(Exception):
 
 class PreserveActiveJobError(ManagerError):
     """A global CLI probe failure that must not cancel a verified pinned job."""
+
+
+# Environmental/transient probe failures that must not destroy a single armed
+# one-shot still waiting for its trigger. The job carries pinned binaries and
+# was validated at enrollment; the next 30-min sync will revalidate it. See
+# B-02 in docs/backlog.md and incident 2026-10-09/2026-10-22.
+_TRANSIENT_PROBE_CODES: frozenset[str] = frozenset(
+    {"TIME_NOT_SYNCHRONIZED", "TASK_ENUMERATION_FAILED"}
+)
+
+
+# Substring signatures lifted from install-*.ps1 throws. The installer runs
+# as `pwsh -File ... -ManagerChildOnly` and its throw strings reach the
+# controller only via subprocess stderr; create_child used to discard that
+# stderr and raise a generic CHILD_INSTALL_FAILED, which is what caused the
+# 2026-10-22 incident to stay silent for 13 days. See B-03 in docs/backlog.md.
+_INSTALLER_SIGNATURES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "CHILD_ADMISSION_REFUSED",
+        (
+            "refusing child enrollment",
+            "allowed only while automatic operation is enabled",
+            "-ManagerChildOnly requires an installed controller policy",
+            "does not pin both immutable installer and guard runtimes",
+            "does not match the immutable runtime pinned",
+            "immutable content-addressed installer runtime",
+            "no longer matches its immutable filename",
+            "requires the controller to supply an explicit -PythonPath",
+            "uses a different Python installation",
+            "do not share one Python installation",
+        ),
+    ),
+    (
+        "CHILD_TIME_UNVERIFIED",
+        (
+            "Windows Time (W32Time) is not running",
+            "w32tm configuration failed",
+            "w32tm resync failed",
+        ),
+    ),
+    (
+        "CHILD_PWSH_FAILED",
+        (
+            "PowerShell 7 or newer is required",
+            "Unable to locate pwsh.exe",
+            "WindowsApps Python execution aliases are not supported",
+            "The Python runtime must",
+            "A final CPython 3.11 or newer runtime is required",
+            "Prerelease Python runtimes are not supported",
+            "Virtual environments are not supported",
+            "Free-threaded CPython builds are not supported",
+            "sibling pythonw.exe",
+            "Python capability probe",
+            "Session 0 is not supported",
+            "Run this installer from the interactive user session",
+            "redirected link",
+            "resolved to a different runtime",
+            "LOCALAPPDATA is unavailable",
+            "This installer only supports Windows",
+        ),
+    ),
+    (
+        "CHILD_TASK_REG_FAILED",
+        (
+            "Failed to grant the private runtime ACL",
+            "Runtime ACL",
+            "The registered task",
+            "More than one nonterminal manifest exists",
+            "Register-ScheduledTask",
+            "ManagerSync resolved more than one",
+            "ManagerSync exported",
+            "active Consume task exported empty XML",
+            "active manifest does not identify an exact Consume task",
+        ),
+    ),
+)
+
+
+def _classify_installer_stderr(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return "CHILD_INSTALL_FAILED"
+    for code, signatures in _INSTALLER_SIGNATURES:
+        for signature in signatures:
+            if signature in text:
+                return code
+    return "CHILD_INSTALL_FAILED"
 
 
 def _utc_text(epoch: int | float) -> str:
@@ -674,12 +760,20 @@ def _validate_policy(policy: Mapping[str, Any]) -> None:
         if not re.fullmatch(r"[0-9a-fA-F]{64}", str(approved.get("codexSha256"))):
             raise ManagerError("POLICY_INVALID")
     blocked = policy.get("blocked")
-    if blocked is not None and (
-        not isinstance(blocked, Mapping) or set(blocked) != {"code", "atUtc"}
-    ):
-        raise ManagerError("POLICY_INVALID")
-    if blocked is not None and not re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", str(blocked.get("code"))):
-        raise ManagerError("POLICY_INVALID")
+    if blocked is not None:
+        if not isinstance(blocked, Mapping):
+            raise ManagerError("POLICY_INVALID")
+        keys = set(blocked)
+        if not {"code", "atUtc"}.issubset(keys) or keys - {"code", "atUtc", "firstCode", "streak"}:
+            raise ManagerError("POLICY_INVALID")
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", str(blocked.get("code"))):
+            raise ManagerError("POLICY_INVALID")
+        first_code = blocked.get("firstCode")
+        if first_code is not None and not re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", str(first_code)):
+            raise ManagerError("POLICY_INVALID")
+        streak = blocked.get("streak")
+        if streak is not None and (type(streak) is not int or streak < 1):
+            raise ManagerError("POLICY_INVALID")
     last_result = policy.get("lastResult")
     if last_result is not None:
         required = {"state", "atUtc", "expiresAtUtc", "failureCode"}
@@ -1109,15 +1203,51 @@ class RealServices:
                 creationflags=WINDOWLESS_SUBPROCESS_FLAGS,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
-            raise ManagerError("CHILD_INSTALL_FAILED") from error
+            self._record_child_install_failure(None, "CHILD_PWSH_FAILED", f"{type(error).__name__}: {error}")
+            raise ManagerError("CHILD_PWSH_FAILED") from error
         if completed.returncode != 0:
-            raise ManagerError("CHILD_INSTALL_FAILED")
+            code = _classify_installer_stderr(completed.stderr or "")
+            self._record_child_install_failure(completed, code, None)
+            raise ManagerError(code)
         for line in reversed(completed.stdout.splitlines()):
             with contextlib.suppress(json.JSONDecodeError):
                 parsed = json.loads(line)
                 if isinstance(parsed, Mapping):
                     return parsed
         raise ManagerError("CHILD_INSTALL_OUTPUT_INVALID")
+
+    def _record_child_install_failure(
+        self,
+        completed: "subprocess.CompletedProcess[str] | None",
+        code: str,
+        extra: str | None,
+    ) -> None:
+        """Append the installer invocation outcome to logs/child-install-*.log.
+
+        Best-effort: must never raise, must never contain policy secrets.
+        The log file lets a human diagnose 538-row deadlock loops in minutes.
+        """
+        try:
+            log_dir = self.root / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            path = log_dir / f"child-install-{stamp}.log"
+            parts: list[str] = [f"[{stamp}] code={code}"]
+            if extra:
+                parts.append(f"extra={extra}")
+            if completed is not None:
+                parts.append(f"returncode={completed.returncode}")
+                stderr_text = (completed.stderr or "").strip()
+                stdout_text = (completed.stdout or "").strip()
+                parts.append("--- stderr ---")
+                parts.append(stderr_text or "(empty)")
+                parts.append("--- stdout tail ---")
+                parts.append(stdout_text[-2048:] if stdout_text else "(empty)")
+            path.write_text("\n".join(parts) + "\n", encoding="utf-8")
+        except Exception:
+            # Never raise during a cleanup path - the caller is already in an
+            # exception flow and the real ManagerError must propagate.
+            pass
 
     def notify(self, title: str, message: str, level: str) -> bool:
         return _shell_notification(title, message, level)
@@ -2139,15 +2269,60 @@ class Controller:
 
     def _block(self, policy: dict[str, Any], code: str) -> None:
         current = policy.get("blocked")
-        if not isinstance(current, Mapping) or current.get("code") != code:
-            policy["blocked"] = {"code": code, "atUtc": _utc_text(self.now())}
+        # Preserve the FIRST non-generic cause across re-blocks so the next
+        # 538-row deadlock does not overwrite the real reason (e.g. a
+        # TIME_NOT_SYNCHRONIZED replaced in-place by CHILD_INSTALL_FAILED).
+        first_code: str | None = None
+        prior_code: str | None = None
+        prior_streak: int = 0
+        prior_at_utc: str | None = None
+        if isinstance(current, Mapping):
+            existing_first = current.get("firstCode")
+            if isinstance(existing_first, str):
+                first_code = existing_first
+            else:
+                existing_code = current.get("code")
+                if isinstance(existing_code, str):
+                    first_code = existing_code
+            existing_code_now = current.get("code")
+            if isinstance(existing_code_now, str):
+                prior_code = existing_code_now
+            existing_streak = current.get("streak")
+            if type(existing_streak) is int and existing_streak >= 1:
+                prior_streak = existing_streak
+            existing_at_utc = current.get("atUtc")
+            if isinstance(existing_at_utc, str):
+                prior_at_utc = existing_at_utc
+        if prior_code == code:
+            # Same-code re-block: increment streak but keep the ORIGINAL atUtc
+            # so blockedAgeSeconds measures the age of the PROBLEM, not the age
+            # of the last tick that observed it (538-row loop otherwise reads
+            # as "age=sync interval" and hides the 13-day outage).
+            new_streak = prior_streak + 1 if prior_streak >= 1 else 2
+            new_blocked: dict[str, Any] = {
+                "code": code,
+                "atUtc": prior_at_utc if prior_at_utc is not None else _utc_text(self.now()),
+                "streak": new_streak,
+            }
+            if first_code is not None and first_code != code:
+                new_blocked["firstCode"] = first_code
+            policy["blocked"] = new_blocked
+        else:
+            new_blocked = {"code": code, "atUtc": _utc_text(self.now()), "streak": 1}
+            if first_code is not None and first_code != code:
+                new_blocked["firstCode"] = first_code
+            policy["blocked"] = new_blocked
+            new_streak = 1
             self._notify_once(
                 f"block:{code}",
                 "Codex Usage Limit Reset Needs Attention",
                 "Automatic scheduling was stopped because a safety check needs attention.",
                 "warning",
             )
-        self._log("blocked", code=code)
+        if first_code is not None and first_code != code:
+            self._log("blocked", code=code, firstCode=first_code, streak=new_streak)
+        else:
+            self._log("blocked", code=code, streak=new_streak)
 
     def _clear_block(self, policy: dict[str, Any]) -> None:
         policy["blocked"] = None
@@ -2171,7 +2346,7 @@ class Controller:
         )
 
     def _log(self, event: str, **fields: Any) -> None:
-        allowed = {key: value for key, value in fields.items() if key in {"automaticLimitResetAtUtc", "code", "expiresAtUtc", "freeResetExpiresAtUtc", "state"}}
+        allowed = {key: value for key, value in fields.items() if key in {"automaticLimitResetAtUtc", "code", "expiresAtUtc", "firstCode", "freeResetExpiresAtUtc", "state", "streak"}}
         payload = {"atUtc": _utc_text(self.now()), "event": event, **allowed}
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("a", encoding="utf-8", newline="\n") as stream:
@@ -2213,8 +2388,19 @@ class Controller:
         )
 
     def _quarantine_barrier(self, policy: dict[str, Any], credits: Sequence[Credit]) -> bool:
+        # B-10 fix: previously this returned True on ANY unresolved quarantine
+        # (unresolved = present-without-absent-timestamp OR absent-and-now<expiresAt),
+        # which globally blocked every enrollment path for ~30 days whenever a
+        # single new POST_DISPATCH_NOTHING_TO_RESET entry was added — even for
+        # a totally different, healthy credit. Confirmed in the research repro
+        # under backup/2026-10-30-B10-quarantine-scope-research/. Narrowed here
+        # to a per-credit check: the first pass over every entry preserves the
+        # defensive hard-raises (REAPPEARED, METADATA_CHANGED) and keeps the
+        # absentObservedAtUtc timestamping, but the final boolean checks ONLY
+        # whether the earliest live credit itself is in an unresolved
+        # quarantine. All other entries just sit in the policy until their
+        # expiresAt passes; a separate orthogonal purge is a follow-up task.
         by_hash = {credit.credit_sha256: credit for credit in credits}
-        unresolved = False
         for entry in policy["quarantine"]:
             present = by_hash.get(entry["creditIdSha256"])
             if present is not None:
@@ -2226,13 +2412,18 @@ class Controller:
                     or present.reset_type != entry["resetType"]
                 ):
                     raise ManagerError("QUARANTINED_CREDIT_METADATA_CHANGED")
-                unresolved = True
             else:
                 if entry["absentObservedAtUtc"] is None:
                     entry["absentObservedAtUtc"] = _utc_text(self.now())
-                if self.now() < entry["expiresAt"]:
-                    unresolved = True
-        return unresolved
+        if not credits:
+            return False
+        earliest_sha = credits[0].credit_sha256
+        for entry in policy["quarantine"]:
+            if entry["creditIdSha256"] != earliest_sha:
+                continue
+            if self.now() < entry["expiresAt"]:
+                return True
+        return False
 
     def _terminal_reconciled(
         self,
@@ -2445,6 +2636,9 @@ class Controller:
             raise
         policy["lastSyncAtUtc"] = _utc_text(self.now())
         self._clear_block(policy)
+        # ManagerChildOnly validates the on-disk policy before enrolling.
+        # Persist the cleared block now; a later failure is written back as blocked.
+        self._save_policy(policy)
         if self._quarantine_barrier(policy, credits):
             self._save_policy(policy)
             return self._status_from_snapshot(policy, current, snapshot, credits, time_state="synchronized", reservation="waiting")
@@ -2572,9 +2766,15 @@ class Controller:
                 # Any fail-closed controller decision must also prevent an
                 # already-enrolled later job from running while attention is
                 # required.  The one-shot audit record itself is retained.
+                # Exception: an environmental/transient probe failure (clock
+                # not yet synchronised, task enumeration glitch) must not
+                # destroy a single armed one-shot that is still waiting for
+                # its trigger - it will be re-validated on the next sync.
                 active = [job for job in jobs if not job.terminal]
                 preserved: Job | None = None
                 if isinstance(error, PreserveActiveJobError) and len(active) == 1:
+                    preserved = active[0]
+                elif error.code in _TRANSIENT_PROBE_CODES and len(active) == 1:
                     preserved = active[0]
                 else:
                     for active_job in active:
@@ -2819,6 +3019,28 @@ class Controller:
             cli_status = "attention"
         if cli_status_override is not None:
             cli_status = cli_status_override
+        blocked_first_code: str | None = None
+        blocked_streak: int | None = None
+        blocked_age_seconds: int | None = None
+        if isinstance(blocked, Mapping):
+            first_code_val = blocked.get("firstCode")
+            if isinstance(first_code_val, str):
+                blocked_first_code = first_code_val
+            streak_val = blocked.get("streak")
+            if type(streak_val) is int and streak_val >= 1:
+                blocked_streak = streak_val
+            at_utc_val = blocked.get("atUtc")
+            if isinstance(at_utc_val, str):
+                with contextlib.suppress(Exception):
+                    blocked_age_seconds = max(0, int(self.now()) - _utc_epoch(at_utc_val))
+        # coverageGap: true when we are blocked AND no armed non-terminal job is
+        # actually scheduled. Checking `reservation in {none,waiting}` is NOT
+        # equivalent: when blocked, the derived `reservation` is masked to
+        # "attention" regardless of the underlying job, which silently hides
+        # the 10-22-style outage this field exists to surface.
+        coverage_gap = isinstance(blocked, Mapping) and (
+            current is None or current.terminal or not current.armed
+        )
         return {
             "automation": automation,
             "enabled": bool(policy["enabled"]),
@@ -2843,6 +3065,10 @@ class Controller:
             "lastResult": policy.get("lastResult"),
             "reservationStatus": reservation,
             "blockedCode": blocked_code,
+            "firstCode": blocked_first_code,
+            "blockedStreak": blocked_streak,
+            "blockedAgeSeconds": blocked_age_seconds,
+            "coverageGap": coverage_gap,
         }
 
     def _status_from_snapshot(
@@ -2963,6 +3189,11 @@ ERROR_MESSAGES = {
     "CONTROLLER_BUSY": "Another manager check is already running.",
     "SYSTEMD_UNAVAILABLE": "The systemd user manager is unavailable.",
     "UI_UNAVAILABLE_ON_LINUX": "The manager UI is not available on Linux.",
+    "CHILD_INSTALL_FAILED": "The child installer could not complete a safety check.",
+    "CHILD_ADMISSION_REFUSED": "The child installer refused because a safety check is still blocked.",
+    "CHILD_TIME_UNVERIFIED": "The child installer could not verify system time.",
+    "CHILD_PWSH_FAILED": "The child installer could not start PowerShell 7.",
+    "CHILD_TASK_REG_FAILED": "The child installer could not register the Scheduled Task.",
 }
 
 
