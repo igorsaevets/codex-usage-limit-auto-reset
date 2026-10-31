@@ -33,7 +33,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 
 UTC = timezone.utc
-APP_VERSION = "2.7.5"
+APP_VERSION = "2.7.6"
 POLICY_SCHEMA_VERSION = 1
 MINIMUM_SCHEDULE_MARGIN_SECONDS = 600
 TASK_START_LEAD_SECONDS = 17 * 60
@@ -331,6 +331,100 @@ def _classify_installer_stderr(text: str) -> str:
     if not isinstance(text, str) or not text:
         return "CHILD_INSTALL_FAILED"
     for code, signatures in _INSTALLER_SIGNATURES:
+        for signature in signatures:
+            if signature in text:
+                return code
+    return "CHILD_INSTALL_FAILED"
+
+
+# Linux twin of _INSTALLER_SIGNATURES. install_linux.py raises InstallError
+# whose messages reach the controller only via subprocess stderr; before this
+# twin, LinuxServices.create_child discarded that stderr and raised a generic
+# CHILD_INSTALL_FAILED - the Linux-side equivalent of the 2026-10-22 silent
+# loop. See the Linux twin of B-03 (v2.7.6).
+_LINUX_INSTALLER_SIGNATURES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "CHILD_ADMISSION_REFUSED",
+        (
+            "Child enrollment requires enabled, unblocked automatic operation",
+            "Executing installer does not match the policy runtime pin",
+            "Guard runtime does not match the policy runtime pin",
+            "Manager policy has no valid approved CLI pin",
+            "Child Codex path differs from the approved CLI pin",
+            "The Codex CLI no longer matches its approved policy pin",
+            "Child CODEX_HOME differs from the ManagerSync environment pin",
+            "Child installer must run under the explicitly pinned Python runtime",
+            "Child mode requires content-addressed installed runtimes",
+            "Guard is not an immutable content-addressed runtime",
+            "Installer is not an immutable content-addressed runtime",
+            "content-addressed runtime hash does not match its filename",
+            "Manager policy did not pin the installed immutable runtimes",
+            "cached npm provenance identity is not canonical",
+            "Immutable runtime path has unexpected content",
+            "Installed runtime hash differs from source",
+            "new Linux installation must start paused",
+            "Codex npm provenance validation",
+        ),
+    ),
+    (
+        "CHILD_TIME_UNVERIFIED",
+        (
+            "Linux system time is not synchronized",
+        ),
+    ),
+    (
+        "CHILD_PWSH_FAILED",
+        (
+            "Linux installer requires native Linux",
+            "Do not run this installer with sudo or as root",
+            "WSL is not supported by the Linux installer",
+            "systemd-based Linux installation is required",
+            "logged-in systemd user session is required",
+            "Python capability probe did not return valid JSON",
+            "Python capability probe returned an invalid document",
+            "selected Python differs from the active one-shot runtime",
+            "systemd user-unit path must be a non-symbolic-link directory",
+            "npm launcher must be an absolute path named npm",
+            "npm was not found on the interactive PATH",
+            "CODEX_HOME must be an absolute, non-symbolic-link directory",
+            "CODEX_HOME is not a directory",
+            "CODEX_HOME must be user-owned",
+        ),
+    ),
+    (
+        "CHILD_TASK_REG_FAILED",
+        (
+            "systemd returned duplicate metadata for",
+            "systemd returned incomplete metadata for",
+            "Loaded systemd unit contract differs from the installed file",
+            "More than one nonterminal manifest exists",
+            "active manifest has an invalid Linux timer name",
+            "active one-shot service is incomplete",
+            "active one-shot installation is incomplete",
+            "active one-shot changed during installation",
+            "active one-shot timer state changed during installation",
+            "ManagerSync timer was not enabled and active",
+            "nonterminal one-shot already exists",
+            "derived one-shot systemd unit already exists",
+            "one-shot timer was not enabled and active",
+            "guard rejected the loaded one-shot task contract",
+            "guard did not arm the one-shot manifest",
+            "armed manifest did not pin the exact timer unit",
+            "partial timer remained enabled or active",
+            "partial manifest did not become DISARMED",
+            "Guard enrollment failed",
+            "Enrollment did not produce one unarmed manifest",
+            "Rollback policy is not an object",
+            "Installation rollback was incomplete",
+        ),
+    ),
+)
+
+
+def _classify_linux_installer_stderr(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return "CHILD_INSTALL_FAILED"
+    for code, signatures in _LINUX_INSTALLER_SIGNATURES:
         for signature in signatures:
             if signature in text:
                 return code
@@ -1541,9 +1635,14 @@ class LinuxServices(RealServices):
                 creationflags=WINDOWLESS_SUBPROCESS_FLAGS,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
-            raise ManagerError("CHILD_INSTALL_FAILED") from error
+            self._record_child_install_failure(
+                None, "CHILD_PWSH_FAILED", f"{type(error).__name__}: {error}"
+            )
+            raise ManagerError("CHILD_PWSH_FAILED") from error
         if completed.returncode != 0:
-            raise ManagerError("CHILD_INSTALL_FAILED")
+            code = _classify_linux_installer_stderr(completed.stderr or "")
+            self._record_child_install_failure(completed, code, None)
+            raise ManagerError(code)
         for line in reversed(completed.stdout.splitlines()):
             with contextlib.suppress(json.JSONDecodeError):
                 parsed = json.loads(line)
@@ -3192,7 +3291,7 @@ ERROR_MESSAGES = {
     "CHILD_INSTALL_FAILED": "The child installer could not complete a safety check.",
     "CHILD_ADMISSION_REFUSED": "The child installer refused because a safety check is still blocked.",
     "CHILD_TIME_UNVERIFIED": "The child installer could not verify system time.",
-    "CHILD_PWSH_FAILED": "The child installer could not start PowerShell 7.",
+    "CHILD_PWSH_FAILED": "The child installer could not start its native runtime.",
     "CHILD_TASK_REG_FAILED": "The child installer could not register the Scheduled Task.",
 }
 
